@@ -29,8 +29,21 @@ func unpack(h uint64) packed {
 }
 
 /*
+A roundabout is effectively an in-memory write-ahead log:
 
-A roundabout is by and large, a very fancy ring buffer
+- Threads publish their planned operation to the log
+- Threads scan the log for all active predecessors, and spin on conflicts
+- Once complete, threads remove their entries from the log
+
+This allows a roundabout to be used for mutual exclusion, as well as coordination between threads:
+
+- A thread can publish an item that blocks all subsequent threads.
+- A thread can also publish an item that only conflicts with writers.
+- A thread is given a (epoch, flag) pair after allocating, which can be used to order operations.
+- Flags allow threads to advise active threads of operations in progress, without taking up room on the log
+- Flags can be set for all new theads, and a thread can wait for old writers to complete.
+
+Internally, a roundabout is just a fancy ring buffer:
 
 - There's a header of (epoch, flags, bitfield32)
 	- The epoch is the next free slot
@@ -40,6 +53,10 @@ A roundabout is by and large, a very fancy ring buffer
 	- The epoch lets us know if an item comes before or after us
 	- State lets us know if it's a special key
 	- Key lets us find conflicting items
+
+The operations are pretty much what you'd do for a ringbuffer, but
+with a bitfield free-list:
+
 - Insertion is
 	- Check epoch+1's bit in the bitfield
 	- If 0, CAS in a new header with epoch+1 and the bitfield updated
@@ -69,6 +86,9 @@ This allows a roundabout to be used in a number of different ways:
 	- But doesn't block new writers
 	- Threads can wait for all predecessors to exit
 	- Can be used to handle concurrent resizes or snapshots
+
+Not bad for a ring buffer, frankly.
+
 */
 
 // roundabout cell states
@@ -82,8 +102,7 @@ const (
 
 	// We could also have AbortCell, AbortAllCell
 	// to force later writers to abandon work
-
-	// A ReadCell that does not conflict with itself
+	// or other behaviour like Spin if Key doesn't match
 )
 
 // a reserved slot in the roundabout
@@ -109,7 +128,7 @@ type fence struct {
 type Roundabout struct {
 	header   atomic.Uint64     // <epoch:16> <flags:16> <bitmap: 32>
 	cells    [32]atomic.Uint64 // <epoch:16> <state:16> <key: 32>
-	conflict func(uint32, uint32) bool
+	Conflict func(uint32, uint32) bool
 }
 
 func (rb *Roundabout) Epoch() uint16 {
@@ -217,11 +236,11 @@ func (rb *Roundabout) wait(r slot) {
 					break
 				}
 
-				if rb.conflict == nil {
+				if rb.Conflict == nil {
 					if r.key == item.body {
 						continue
 					}
-				} else if rb.conflict(r.key, item.body) {
+				} else if rb.Conflict(r.key, item.body) {
 					continue
 				}
 			}
@@ -333,7 +352,6 @@ func (rb *Roundabout) clearFence(s fence) uint16 {
 }
 
 // run the callback when no other callbacks with the same key are active
-
 func (rb *Roundabout) SpinLock(key uint32, fn func(uint16, uint16) error) error {
 	for true {
 		slot, ok := rb.push(key, SpinCell)
@@ -367,8 +385,26 @@ func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 	return nil
 }
 
+// run the callback when no other callbacks with the same key are active
+// except other readers
+func (rb *Roundabout) SpinRead(key uint32, fn func(uint16, uint16) error) error {
+	for true {
+		slot, ok := rb.push(key, ReadCell)
+		if !ok {
+			continue
+		}
+
+		rb.wait(slot)
+		defer rb.pop(slot)
+
+		return fn(slot.epoch, slot.flags)
+	}
+	// huh
+	return nil
+}
+
 // update these flags, run the callback, clear the flags
-func (rb *Roundabout) Signal(flags uint16, fn func(uint16, uint16) error) error {
+func (rb *Roundabout) Fence(flags uint16, fn func(uint16, uint16) error) error {
 	for true {
 		fence, ok := rb.setFence(flags) // spins until flags are set
 		if !ok {
