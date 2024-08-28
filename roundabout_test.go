@@ -10,12 +10,9 @@ import (
 
 func TestRoundabout(t *testing.T) {
 	b := Roundabout{}
-	b.init()
 	t.Log(b.String())
 	r1, _ := b.push(1)
-	t.Log(b.String())
 	r2, _ := b.push(1)
-	t.Log(b.String())
 	r3, _ := b.push(1)
 	t.Log(b.String())
 
@@ -36,16 +33,16 @@ func TestRoundabout(t *testing.T) {
 	if !done {
 		t.Error("r2 not complete")
 	}
+	t.Log(b.String())
 }
 
 func TestEnqueue(t *testing.T) {
 	b := Roundabout{}
-	b.init()
 	go b.Signal(123, func() error { return nil })
 	r1, _ := b.push(1)
 	rX, _ := b.push(10)
 	rY, _ := b.push(10)
-	var r3 entry
+	var r3 slot
 
 	var done bool
 	go func() {

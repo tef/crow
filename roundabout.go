@@ -7,24 +7,34 @@ import (
 	"sync/atomic"
 )
 
-type cell struct {
+const width = 32
+
+const (
+	ZeroCell uint16 = iota 
+	FreeCell
+	ClaimedCell
+)
+
+type packed struct {
 	epoch uint16
 	state uint16
 	body  uint32
 }
 
-func (c cell) pack() uint64 {
+func (c packed) pack() uint64 {
 	return (uint64(c.epoch) << 48) | (uint64(c.state) << 32) | uint64(c.body)
 }
 
-func unpack(h uint64) cell {
+func unpack(h uint64) packed {
 	var epoch uint16 = uint16((h >> 48) & 65535)
 	var state uint16 = uint16((h >> 32) & 65535)
 	var body uint32 = uint32(h & 2147483647)
-	return cell{epoch, state, body}
+	return packed{epoch, state, body}
 }
 
-type entry struct {
+// a slot in the roundabout
+
+type slot struct {
 	n      int
 	epoch  uint16
 	flags  uint16
@@ -32,7 +42,6 @@ type entry struct {
 	bitmap uint32
 }
 
-const width = 32
 
 type Roundabout struct {
 	header   atomic.Uint64     // <epoch:16> <flags:16> <bitmap: 32>
@@ -49,15 +58,7 @@ func (rb *Roundabout) String() string {
 	)
 }
 
-func (rb *Roundabout) init() {
-	for i := 0; i < 32; i++ {
-		item := cell{uint16(i), 0, 0}.pack()
-		rb.cells[i].Store(item)
-
-	}
-}
-
-func (rb *Roundabout) push(lane uint32) (entry, bool) {
+func (rb *Roundabout) push(lane uint32) (slot, bool) {
 	header := rb.header.Load()
 
 	h := unpack(header)
@@ -66,12 +67,12 @@ func (rb *Roundabout) push(lane uint32) (entry, bool) {
 	var b uint32 = 1 << n
 
 	if h.body&b == 0 {
-		new_header := cell{h.epoch + 1, h.state, h.body | b}.pack()
-		item := cell{h.epoch, 1, lane}.pack()
+		new_header := packed{h.epoch + 1, h.state, h.body|b}.pack()
+		item := packed{h.epoch, ClaimedCell, lane}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			rb.cells[n].Store(item)
-			e := entry{
+			e := slot{
 				n:      n,
 				epoch:  h.epoch,
 				flags:  h.state,
@@ -83,10 +84,10 @@ func (rb *Roundabout) push(lane uint32) (entry, bool) {
 		}
 	}
 
-	return entry{}, false
+	return slot{}, false
 }
 
-func (rb *Roundabout) wait(r entry) {
+func (rb *Roundabout) wait(r slot) {
 	// n.b we will never scan epoch -32 to 0 for the first cycle
 	// as the bitmap in the header is all zeros
 
@@ -106,7 +107,7 @@ func (rb *Roundabout) wait(r entry) {
 	for i := 0; i < 31; i++ {
 		epoch++
 		bitmap = bitmap >> 1
-		if bitmap&1 == 0 {
+		if bitmap&1 == 0 { // free space
 			continue
 		}
 		// fmt.Println(r.epoch,":", epoch, bitmap&1)
@@ -114,17 +115,17 @@ func (rb *Roundabout) wait(r entry) {
 		n := int(epoch) % width
 		for true {
 			item := unpack(rb.cells[n].Load())
-			// fmt.Println(item)
-
-			if item.epoch == epoch {
+			if item.state == ZeroCell {
+				// spin, uninitialised memory
+				continue 
+			} else if item.epoch == epoch {
 				// item has expected epoch of item in past
-				if item.state == 0 {
-					// not initialised yet, spin
+				// has been allocated on bitmap
+				// check cell has been written
+
+				if item.state == FreeCell {
 					continue
 				}
-
-				// we have an item that precedes us
-				// with a valid lane
 
 				if rb.conflict == nil {
 					if r.lane == item.body {
@@ -141,14 +142,14 @@ func (rb *Roundabout) wait(r entry) {
 
 }
 
-func (rb *Roundabout) pop(r entry) {
+func (rb *Roundabout) pop(r slot) {
 	// when we're done, we replace our cell with
 	// an empty cell for the next value
 	// so that waiting threads can skip
 	// and newer waiting threads can pause
 	// once it is allocated again
 
-	next_item := cell{r.epoch + width, 0, 0}.pack()
+	next_item := packed{r.epoch + width, FreeCell, 0}.pack()
 	rb.cells[r.n].Store(next_item)
 
 	var b uint64 = 1 << r.n
@@ -161,7 +162,7 @@ func (rb *Roundabout) pushFlags(flags uint16) {
 		header := rb.header.Load()
 		h := unpack(header)
 
-		new_header := cell{h.epoch, h.state | flags, h.body}.pack()
+		new_header := packed{h.epoch, h.state | flags, h.body}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			break
@@ -175,7 +176,7 @@ func (rb *Roundabout) popFlags(flags uint16) {
 		header := rb.header.Load()
 		h := unpack(header)
 
-		new_header := cell{h.epoch, h.state ^ flags, h.body}.pack()
+		new_header := packed{h.epoch, h.state ^ flags, h.body}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			break
@@ -185,15 +186,15 @@ func (rb *Roundabout) popFlags(flags uint16) {
 }
 func (rb *Roundabout) Enqueue(lane uint32, fn func(uint16) error) error {
 	for true {
-		entry, ok := rb.push(lane)
+		slot, ok := rb.push(lane)
 		if !ok {
 			continue
 		}
 
-		rb.wait(entry)
-		defer rb.pop(entry)
+		rb.wait(slot)
+		defer rb.pop(slot)
 
-		return fn(entry.flags)
+		return fn(slot.flags)
 	}
 	// huh
 	return nil
