@@ -9,11 +9,28 @@ import (
 // t.Fatal /  t.FatalF,  mark fail, exit
 
 func TestRoundabout(t *testing.T) {
+	b2 := Roundabout{}
+	start, _ := b2.push(1001, SpinCell)
+	ended, _ := b2.push(1001, SpinCell)
+
 	b := Roundabout{}
 	t.Log(b.String())
-	r1, _ := b.push(1)
-	r2, _ := b.push(1)
-	r3, _ := b.push(1)
+
+	go func() {
+		t.Log("popping")
+		b.Phase(123, func() error {
+			t.Log("in signal", b.String())
+			b2.pop(start)
+			b.push(1111, SpinCell)
+			return nil
+		}, func(start, end uint16) error {
+			t.Log("from", start, "to", end)
+			return nil
+		})
+	}()
+	r1, _ := b.push(1, SpinCell)
+	r2, _ := b.push(1, SpinCell)
+	r3, _ := b.push(1, SpinCell)
 	t.Log(b.String())
 
 	var done bool
@@ -26,28 +43,30 @@ func TestRoundabout(t *testing.T) {
 
 	b.wait(r1)
 	b.pop(r1)
-	t.Log(b.String())
+	t.Log("pop", b.String())
 
 	b.wait(r3)
 	b.pop(r3)
 	if !done {
 		t.Error("r2 not complete")
 	}
+	t.Log("waiting for first three ended", b2.String())
+
+	b2.wait(ended)
 	t.Log(b.String())
 }
 
-func TestEnqueue(t *testing.T) {
+func TestSpinLock(t *testing.T) {
 	b := Roundabout{}
-	go b.Signal(123, func() error { return nil })
-	r1, _ := b.push(1)
-	rX, _ := b.push(10)
-	rY, _ := b.push(10)
+	r1, _ := b.push(1, SpinCell)
+	rX, _ := b.push(10, SpinCell)
+	rY, _ := b.push(10, SpinCell)
 	var r3 slot
 
 	var done bool
 	go func() {
-		b.Enqueue(1, func(uint16) error {
-			r3, _ = b.push(1)
+		b.SpinLock(1, func(uint16) error {
+			r3, _ = b.push(1, SpinCell)
 			b.pop(rX)
 			done = true
 			return nil
