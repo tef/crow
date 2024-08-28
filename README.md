@@ -4,35 +4,37 @@ A work in progress.
 
 ## Roundabouts
 
-A roundabout is like a write-ahead-log. Threads publish what they want to work to the log, scan the predecessors for conflicts, and then clear their entry when done. This allows a roundabout to be used for mutual exclusion.
+A roundabout is like a write-ahead-log. Threads publish what they want to work to the log, scan the predecessors for conflicts, and then clear their entry when done. This allows a roundabout to be used for mutual exclusion, as well as coordination between threads.
 
 Here's what it looks like:
 
 ```
-// an empty struct is always a valid
 r := crow.Roundabout{}
 
 var key uint32 = 12234
 r.SpinLock(key, func(flags uint16) {
     // this callback will never be invoked while other callbacks
     // are running with the same key
+
     ...
 })
 
 r.SpinLockAll(func(flags uint16) {
-    // spin until no older threads
-    // all other threads will spin
+    // will only run after all older threads exit
+    // will stall all newer threads from running
+
+    ...
 })
 ```
 
-This has some advantages and disadvantages, or tradeoffs.
+This has some advantages and disadvantages.
 
-Despite being a log, a roundabout sits between "fine grained locks" and "one big locks", an alternative to RWLocks:
+Despite being a log, a roundabout sits between "fine grained locks" and "one big locks":
 
-- Like a Big Lock, the roundabout can offer exclusive access
+- Like a Big Lock, the roundabout can offer exclusive access.
 - Like a RWLock, there is a bound on the number of users (here, 32)
-- Like Fine Grained Locking, multiple writers can be active
-- Unlike fine grained locking, there isn't any per-item overhead
+- Like Fine Grained Locking, multiple writers can be active.
+- Unlike fine grained locking, there isn't any per-item overhead.
 
 Underneath, it's comprised of a ring buffer of work items, using a bitfield instead of a count to manage freeing items. This allows us to do some not very ring buffer things like removing arbitrary items from the list, but it also limits us to having a quite small ringbuffer.
 
@@ -57,5 +59,4 @@ rb.Phase(flags, func() error{
 
 })
 ```
-
 

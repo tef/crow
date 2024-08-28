@@ -9,12 +9,7 @@ import (
 
 const width = 32
 
-const (
-	ZeroCell uint16 = iota
-	FreeCell
-	SpinCell
-	SpinAllCell
-)
+// for packing and unpacking an int64 into three parts
 
 type packed struct {
 	epoch uint16
@@ -33,31 +28,98 @@ func unpack(h uint64) packed {
 	return packed{epoch, state, body}
 }
 
-// a slot in the roundabout
+/*
 
+A roundabout is by and large, a very fancy ring buffer
+
+- There's a header of (epoch, flags, bitfield32)
+	- The epoch is the next free slot
+	- The bitfield tracks which items are allocated in the ring buffer
+	- The flags are passed on to mutator threads allocating
+- There's items of (epoch, state, key32)
+	- The epoch lets us know if an item comes before or after us
+	- State lets us know if it's a special key
+	- Key lets us find conflicting items
+- Insertion is
+	- Check epoch+1's bit in the bitfield
+	- If 0, CAS in a new header with epoch+1 and the bitfield updated
+- Scanning is
+	- With the bitfield from allocation, scan the ring buffer
+	- If the epoch is what we expect for an earlier item, check it
+	- Spin if there's a conflict
+- Freeing is
+	- Replace item with (epoch+width, free_state, 0)
+	- This lets later writers skip the entry, or spin until it's allocated
+	- CAS in a new header with the bitfield updated
+
+This allows a roundabout to be used in a number of different ways:
+
+- Like a fine grained lock
+	- Each thread inserts a 32bit key, and spins if there's a match
+- Like a single, big lock
+	- The mutator threads spin until all predecessors are complete
+	- Succesor threads spin when encountering a big lock in the log
+- Like a reader, writer lock
+	- Readers create conflict free log items
+	- Only writers force mutual exclusion
+- Like an optimistic read lock
+	- Checking the epoch before and after reads
+- Like an epoch
+	- Changing the header affects all subsequent writers
+	- But doesn't block new writers
+	- Threads can wait for all predecessors to exit
+	- Can be used to handle concurrent resizes or snapshots
+*/
+
+// roundabout cell states
+const (
+	ZeroCell uint16 = iota
+	FreeCell
+	SpinCell
+	SpinAllCell
+
+	ReadCell
+
+	// We could also have AbortCell, AbortAllCell
+	// to force later writers to abandon work
+
+	// A ReadCell that does not conflict with itself
+)
+
+// a reserved slot in the roundabout
 type slot struct {
 	n      int
 	epoch  uint16
 	flags  uint16
 	state  uint16
-	lane   uint32
+	key    uint32
 	bitmap uint32
 }
 
-// a signal on the roundabout
-
-type signal struct {
-	epoch  uint16
-	flags  uint16
-	bitmap uint32
+// a change to the headers
+type fence struct {
+	epoch     uint16
+	flags     uint16
+	new_flags uint16
+	bitmap    uint32
 }
 
-// Finally, a real data structure:
+// and the actual structure itself:
 
 type Roundabout struct {
 	header   atomic.Uint64     // <epoch:16> <flags:16> <bitmap: 32>
-	cells    [32]atomic.Uint64 // <epoch:16> <state:16> <lane: 32>
+	cells    [32]atomic.Uint64 // <epoch:16> <state:16> <key: 32>
 	conflict func(uint32, uint32) bool
+}
+
+func (rb *Roundabout) Epoch() uint16 {
+	h := unpack(rb.header.Load())
+	return h.epoch
+}
+
+func (rb *Roundabout) Flags() uint16 {
+	h := unpack(rb.header.Load())
+	return h.state
 }
 
 func (rb *Roundabout) String() string {
@@ -69,7 +131,11 @@ func (rb *Roundabout) String() string {
 	)
 }
 
-func (rb *Roundabout) push(lane uint32, state uint16) (slot, bool) {
+// push a new item onto the log, with a given key and state
+// the state is "Spin" or "SpinAll", and the key is usually
+// some hash value
+
+func (rb *Roundabout) push(key uint32, state uint16) (slot, bool) {
 	header := rb.header.Load()
 
 	h := unpack(header)
@@ -79,7 +145,7 @@ func (rb *Roundabout) push(lane uint32, state uint16) (slot, bool) {
 
 	if h.body&b == 0 {
 		new_header := packed{h.epoch + 1, h.state, h.body | b}.pack()
-		item := packed{h.epoch, state, lane}.pack()
+		item := packed{h.epoch, state, key}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			rb.cells[n].Store(item)
@@ -88,7 +154,7 @@ func (rb *Roundabout) push(lane uint32, state uint16) (slot, bool) {
 				epoch:  h.epoch,
 				flags:  h.state,
 				state:  state,
-				lane:   lane,
+				key:    key,
 				bitmap: h.body,
 			}
 			return e, true
@@ -98,6 +164,9 @@ func (rb *Roundabout) push(lane uint32, state uint16) (slot, bool) {
 
 	return slot{}, false
 }
+
+// after allocating a slot on the roundabout, we scan predecessors
+// to find conflicts
 
 func (rb *Roundabout) wait(r slot) {
 	// n.b we will never scan epoch -32 to 0 for the first cycle
@@ -143,13 +212,16 @@ func (rb *Roundabout) wait(r slot) {
 				} else if r.state == SpinAllCell {
 					// wait for all predecessors
 					continue
+				} else if r.state == ReadCell && item.state == ReadCell {
+					// ReadCells can only conflict with different types
+					break
 				}
 
 				if rb.conflict == nil {
-					if r.lane == item.body {
+					if r.key == item.body {
 						continue
 					}
-				} else if rb.conflict(r.lane, item.body) {
+				} else if rb.conflict(r.key, item.body) {
 					continue
 				}
 			}
@@ -159,13 +231,9 @@ func (rb *Roundabout) wait(r slot) {
 	}
 }
 
+// mark our work as complete, updating the item in the buffer
+// before updating the header
 func (rb *Roundabout) pop(r slot) {
-	// when we're done, we replace our cell with
-	// an empty cell for the next value
-	// so that waiting threads can skip
-	// and newer waiting threads can pause
-	// once it is allocated again
-
 	next_item := packed{r.epoch + width, FreeCell, 0}.pack()
 	rb.cells[r.n].Store(next_item)
 
@@ -173,34 +241,43 @@ func (rb *Roundabout) pop(r slot) {
 	rb.header.And(^b) // go 1.23 needed
 }
 
-func (rb *Roundabout) setFence(flags uint16) (signal, bool) {
+// update the header in the buffer, so that all
+// new mutators see flags
+
+func (rb *Roundabout) setFence(flags uint16) (fence, bool) {
 	header := rb.header.Load()
 	h := unpack(header)
 
 	if h.state&flags != 0 {
 		// can't set flags, already set
-		return signal{}, false
+		return fence{}, false
 	}
 
 	new_header := packed{h.epoch, h.state | flags, h.body}.pack()
 
 	if rb.header.CompareAndSwap(header, new_header) {
-		s := signal{
-			epoch:  h.epoch,
-			flags:  flags,
-			bitmap: h.body,
+		s := fence{
+			epoch:     h.epoch,
+			flags:     flags,
+			new_flags: h.state | flags,
+			bitmap:    h.body,
 		}
 		return s, true
 	}
-	return signal{}, false
+	return fence{}, false
 }
 
-func (rb *Roundabout) spinFence(s signal) {
+// now that we've update the header, we wait for
+// all earlier work to complete
+
+func (rb *Roundabout) spinFence(s fence) {
 	if s.bitmap == 0 {
 		return
 	}
 
-	// we check from epoch-32 to epoch-1
+	// there's no allocation made for flag changes
+	// so we check from epoch-32 to epoch-1
+
 	epoch := s.epoch - uint16(32)
 	n := int(s.epoch) % width
 
@@ -208,7 +285,7 @@ func (rb *Roundabout) spinFence(s signal) {
 	// and epoch +1 is in next larger bit.
 	bitmap := bits.RotateLeft32(s.bitmap, -n)
 
-	// the free bitmap is a snapshot of where we were on allocation
+	// the free bitmap is a snapshot of where we were on header update
 	// so will not include any items ahead of us
 
 	for i := 0; i < 32; i++ {
@@ -237,8 +314,10 @@ func (rb *Roundabout) spinFence(s signal) {
 	}
 }
 
-func (rb *Roundabout) clearFence(s signal) uint16 {
-	// assumes you want the flags cleared
+// clear out flags, OR'ing out our changes
+// and again, only affecting new writers
+
+func (rb *Roundabout) clearFence(s fence) uint16 {
 	for true {
 		header := rb.header.Load()
 		h := unpack(header)
@@ -253,7 +332,26 @@ func (rb *Roundabout) clearFence(s signal) uint16 {
 
 }
 
-func (rb *Roundabout) SpinLockAll(fn func(uint16) error) error {
+// run the callback when no other callbacks with the same key are active
+
+func (rb *Roundabout) SpinLock(key uint32, fn func(uint16, uint16) error) error {
+	for true {
+		slot, ok := rb.push(key, SpinCell)
+		if !ok {
+			continue
+		}
+
+		rb.wait(slot)
+		defer rb.pop(slot)
+
+		return fn(slot.epoch, slot.flags)
+	}
+	// huh
+	return nil
+}
+
+// run the callback once all other callbacks have ended
+func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 	for true {
 		slot, ok := rb.push(0, SpinAllCell)
 		if !ok {
@@ -262,58 +360,47 @@ func (rb *Roundabout) SpinLockAll(fn func(uint16) error) error {
 
 		rb.wait(slot)
 		defer rb.pop(slot)
-
-		return fn(slot.flags)
+		// maybe think about passing in epoch and flags
+		return fn(slot.epoch, slot.flags)
 	}
 	// huh
 	return nil
 }
 
-func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16) error) error {
+// update these flags, run the callback, clear the flags
+func (rb *Roundabout) Signal(flags uint16, fn func(uint16, uint16) error) error {
 	for true {
-		slot, ok := rb.push(lane, SpinCell)
+		fence, ok := rb.setFence(flags) // spins until flags are set
 		if !ok {
 			continue
 		}
 
-		rb.wait(slot)
-		defer rb.pop(slot)
+		rb.spinFence(fence)
 
-		return fn(slot.flags)
-	}
-	// huh
-	return nil
-}
-
-func (rb *Roundabout) Signal(flags uint16, fn func() error) error {
-	for true {
-		signal, ok := rb.setFence(flags) // spins until flags are set
-		if !ok {
-			continue
-		}
-
-		rb.spinFence(signal)
-
-		defer rb.clearFence(signal)
-		return fn()
+		defer rb.clearFence(fence)
+		return fn(fence.epoch, fence.new_flags)
 	}
 	return nil
 }
+
+// update the flags, run the first callback,
+// clear the flags, run the second callback
+
 func (rb *Roundabout) Phase(flags uint16, fn func() error, after func(uint16, uint16) error) error {
 	for true {
-		signal, ok := rb.setFence(flags) // spins until flags are set
+		fence, ok := rb.setFence(flags) // spins until flags are set
 		if !ok {
 			continue
 		}
 
-		rb.spinFence(signal)
+		rb.spinFence(fence)
 
 		err := fn()
-		end := rb.clearFence(signal)
+		end := rb.clearFence(fence)
 		if err != nil {
 			return err
 		}
-		return after(signal.epoch, end)
+		return after(fence.epoch, end)
 	}
 	return nil
 }

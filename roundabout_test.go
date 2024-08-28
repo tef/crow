@@ -65,7 +65,7 @@ func TestSpinLock(t *testing.T) {
 
 	var done bool
 	go func() {
-		b.SpinLock(1, func(uint16) error {
+		b.SpinLock(1, func(uint16, uint16) error {
 			r3, _ = b.push(1, SpinCell)
 			b.pop(rX)
 			done = true
@@ -101,7 +101,7 @@ func TestSpinLockAll(t *testing.T) {
 
 	var done bool
 	go func() {
-		b.SpinLock(1, func(uint16) error {
+		b.SpinLock(1, func(uint16, uint16) error {
 			t.Log("in lock")
 			done = true
 			rb.pop(rb1)
