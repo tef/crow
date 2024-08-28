@@ -89,6 +89,41 @@ func TestSpinLock(t *testing.T) {
 	}
 }
 
+func TestSpinLockAll(t *testing.T) {
+	rb := Roundabout{}
+
+	rb1, _ := rb.push(1, SpinCell)
+	rb2, _ := rb.push(1, SpinCell)
+
+	b := Roundabout{}
+	r1, _ := b.push(1, SpinCell)
+	r2, _ := b.push(2, SpinCell)
+
+	var done bool
+	go func() {
+		b.SpinLock(1, func(uint16) error {
+			t.Log("in lock")
+			done = true
+			rb.pop(rb1)
+			return nil
+		})
+
+	}()
+
+	b.wait(r1)
+	b.pop(r1)
+	b.wait(r2)
+	b.pop(r2)
+	t.Log("waiting on rb2")
+
+	rb.wait(rb2)
+	rb.pop(rb2)
+
+	if !done {
+		t.Error("r2 not complete")
+	}
+}
+
 func BenchRoundabout(b *testing.B) {
 	// setup
 	b.ResetTimer()

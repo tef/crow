@@ -39,6 +39,7 @@ type slot struct {
 	n      int
 	epoch  uint16
 	flags  uint16
+	state  uint16
 	lane   uint32
 	bitmap uint32
 }
@@ -86,6 +87,7 @@ func (rb *Roundabout) push(lane uint32, state uint16) (slot, bool) {
 				n:      n,
 				epoch:  h.epoch,
 				flags:  h.state,
+				state:  state,
 				lane:   lane,
 				bitmap: h.body,
 			}
@@ -135,7 +137,11 @@ func (rb *Roundabout) wait(r slot) {
 
 				if item.state == FreeCell {
 					continue
-				} else if item.state == SpinAll {
+				} else if item.state == SpinAllCell {
+					// wait for big spin
+					continue
+				} else if r.state == SpinAllCell {
+					// wait for all predecessors
 					continue
 				}
 
