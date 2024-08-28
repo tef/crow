@@ -10,6 +10,7 @@ import (
 
 func TestRoundabout(t *testing.T) {
 	b := Roundabout{}
+	b.init()
 	r1 := b.push(1)
 	r2 := b.push(1)
 	r3 := b.push(1)
@@ -34,6 +35,7 @@ func TestRoundabout(t *testing.T) {
 
 func TestEnqueue(t *testing.T) {
 	b := Roundabout{}
+	b.init()
 	go b.Signal(123, func() error { return nil })
 	r1 := b.push(1)
 	rX := b.push(10)

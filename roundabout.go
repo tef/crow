@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 )
 
+// return header/items from push/pop/shift etc
+// move flag bit for alloc out of epochm
 // get rid of rid
 // flag for number
 
@@ -21,14 +23,14 @@ type rid struct {
 
 // split4? maybe a type alias for cell and header
 
-func split3(h uint64) (uint16, uint16, uint32) {
+func unpack3(h uint64) (uint16, uint16, uint32) {
 	var epoch uint16 = uint16((h >> 48) & 65535)
 	var flags uint16 = uint16((h >> 32) & 65535)
 	var body uint32 = uint32(h & 2147483647)
 	return epoch, flags, body
 }
 
-func join3(epoch uint16, flags uint16, body uint32) uint64 {
+func pack3(epoch uint16, flags uint16, body uint32) uint64 {
 	return (uint64(epoch) << 48) | (uint64(flags) << 32) | uint64(body)
 }
 
@@ -41,10 +43,18 @@ type Roundabout struct {
 	conflict func(uint32, uint32) bool
 }
 
+func (br *Roundabout) init() {
+	for i := 0; i < 32; i++ {
+		item := pack3(uint16(i), 0, 0)
+		br.cells[i].Store(item)
+
+	}
+}
+
 func (br *Roundabout) String() string {
 	h := br.header.Load()
 
-	epoch, flags, bitmap := split3(h)
+	epoch, flags, bitmap := unpack3(h)
 
 	return fmt.Sprintf("%v [%v] %v",
 		strconv.FormatUint(uint64(bitmap), 2),
@@ -80,9 +90,9 @@ func (br *Roundabout) pushFlags(flags uint16) {
 	for true {
 		h := br.header.Load()
 
-		epoch, old_flags, bitmap := split3(h)
+		epoch, old_flags, bitmap := unpack3(h)
 
-		h2 := join3(epoch, old_flags|flags, bitmap)
+		h2 := pack3(epoch, old_flags|flags, bitmap)
 
 		if br.header.CompareAndSwap(h, h2) {
 			break
@@ -95,9 +105,9 @@ func (br *Roundabout) popFlags(flags uint16) {
 	for true {
 		h := br.header.Load()
 
-		epoch, old_flags, bitmap := split3(h)
+		epoch, old_flags, bitmap := unpack3(h)
 
-		h2 := join3(epoch, old_flags^flags, bitmap)
+		h2 := pack3(epoch, old_flags^flags, bitmap)
 
 		if br.header.CompareAndSwap(h, h2) {
 			break
@@ -110,7 +120,7 @@ func (br *Roundabout) push(lane uint32) *rid {
 	width := 32
 	h := br.header.Load()
 
-	epoch, flags, bitmap := split3(h)
+	epoch, flags, bitmap := unpack3(h)
 
 	n := int(epoch) % width
 	var b uint32 = 1 << n
@@ -119,9 +129,9 @@ func (br *Roundabout) push(lane uint32) *rid {
 	// the insertion into the cell is marked
 	// as complete
 
-	h2 := join3(epoch+1, flags|1, bitmap|b)
+	h2 := pack3(epoch+1, flags|1, bitmap|b)
 
-	i := join3(epoch, flags|1, lane)
+	i := pack3(epoch, flags|1, lane)
 
 	if bitmap&b == 0 {
 		if br.header.CompareAndSwap(h, h2) {
@@ -172,12 +182,7 @@ func (br *Roundabout) wait(r *rid) {
 		n := int(epoch) % width
 		for true {
 			item := br.cells[n].Load()
-			item_epoch, item_flags, item_lane := split3(item)
-
-			// again, as we will only ever check cells that
-			// have been written to at least once, they
-			// will all have a valid epoch
-			// and only have flags cleared on removal
+			item_epoch, item_flags, item_lane := unpack3(item)
 
 			if item_epoch == epoch {
 				// item has expected epoch of item in past
@@ -211,7 +216,7 @@ func (br *Roundabout) pop(r *rid) {
 	// and newer waiting threads can pause
 	// once it is allocated again
 
-	next_item := join3(r.epoch+32, 0, 0)
+	next_item := pack3(r.epoch+32, 0, 0)
 	br.cells[r.n].Store(next_item)
 
 	var b uint64 = 1 << r.n
