@@ -34,6 +34,7 @@ func TestRoundabout(t *testing.T) {
 
 func TestEnqueue(t *testing.T) {
 	b := Roundabout{}
+	go b.Signal(123, func() error { return nil })
 	r1 := b.push(1)
 	rX := b.push(10)
 	rY := b.push(10)

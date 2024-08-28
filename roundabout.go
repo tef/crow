@@ -16,7 +16,7 @@ type rid struct {
 
 	epoch uint16
 	flags uint16
-	key   uint32
+	lane  uint32
 }
 
 // split4? maybe a type alias for cell and header
@@ -53,9 +53,9 @@ func (br *Roundabout) String() string {
 	)
 }
 
-func (br *Roundabout) Enqueue(key uint32, fn func(uint16) error) error {
+func (br *Roundabout) Enqueue(lane uint32, fn func(uint16) error) error {
 	for true {
-		rid := br.push(key)
+		rid := br.push(lane)
 		if rid == nil {
 			continue
 		}
@@ -69,15 +69,44 @@ func (br *Roundabout) Enqueue(key uint32, fn func(uint16) error) error {
 	return nil
 }
 
-func (br *Roundabout) pushFlags(flags uint16) {
+func (br *Roundabout) Signal(flags uint16, fn func() error) error {
+	br.pushFlags(flags)
+	defer br.popFlags(flags)
+	return fn()
+}
 
+func (br *Roundabout) pushFlags(flags uint16) {
+	// return epoch? header?
+	for true {
+		h := br.header.Load()
+
+		epoch, old_flags, bitmap := split3(h)
+
+		h2 := join3(epoch, old_flags|flags, bitmap)
+
+		if br.header.CompareAndSwap(h, h2) {
+			break
+		}
+	}
 }
 
 func (br *Roundabout) popFlags(flags uint16) {
+	// return epoch
+	for true {
+		h := br.header.Load()
+
+		epoch, old_flags, bitmap := split3(h)
+
+		h2 := join3(epoch, old_flags^flags, bitmap)
+
+		if br.header.CompareAndSwap(h, h2) {
+			break
+		}
+	}
 
 }
 
-func (br *Roundabout) push(key uint32) *rid {
+func (br *Roundabout) push(lane uint32) *rid {
 	width := 32
 	h := br.header.Load()
 
@@ -92,7 +121,7 @@ func (br *Roundabout) push(key uint32) *rid {
 
 	h2 := join3(epoch+1, flags|1, bitmap|b)
 
-	i := join3(epoch, flags|1, key)
+	i := join3(epoch, flags|1, lane)
 
 	if bitmap&b == 0 {
 		if br.header.CompareAndSwap(h, h2) {
@@ -102,7 +131,7 @@ func (br *Roundabout) push(key uint32) *rid {
 				n:      n,
 				epoch:  epoch,
 				flags:  flags,
-				key:    key,
+				lane:   lane,
 			}
 			return rid
 
@@ -143,7 +172,7 @@ func (br *Roundabout) wait(r *rid) {
 		n := int(epoch) % width
 		for true {
 			item := br.cells[n].Load()
-			item_epoch, item_flags, item_key := split3(item)
+			item_epoch, item_flags, item_lane := split3(item)
 
 			// again, as we will only ever check cells that
 			// have been written to at least once, they
@@ -158,13 +187,13 @@ func (br *Roundabout) wait(r *rid) {
 				}
 
 				// we have an item that precedes us
-				// with a valid key
+				// with a valid lane
 
 				if br.conflict == nil {
-					if r.key == item_key {
+					if r.lane == item_lane {
 						continue
 					}
-				} else if br.conflict(r.key, item_key) {
+				} else if br.conflict(r.lane, item_lane) {
 					continue
 				}
 			}
