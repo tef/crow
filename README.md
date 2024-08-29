@@ -6,9 +6,9 @@ A work in progress.
 
 A roundabout is like a write-ahead-log. Threads publish what they want to work to the log, scan the predecessors for conflicts, and then clear their entry when done. This allows a roundabout to be used for mutual exclusion, as well as coordination between threads.
 
-A roundabout can be used for big locks, fine grained locks, reader-writer locks, as well as coordinating things like resizing or snapshots.
+A roundabout can be used for big locks, fine grained locks, reader-writer locks, as well as coordinating things like resizing or snapshots. Here's what it looks like:
 
-Here's what it looks like:
+```
 r := Roundabout{}
 
 var key uint32 = 12234
