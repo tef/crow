@@ -49,10 +49,10 @@ Internally, a roundabout is just a fancy ring buffer:
 	- The epoch is the next free slot
 	- The bitfield tracks which items are allocated in the ring buffer
 	- The flags are passed on to mutator threads allocating
-- There's items of (epoch, state, key32)
-	- The epoch lets us know if an item comes before or after us
-	- State lets us know if it's a special key
-	- Key lets us find conflicting items
+- There's items of (epoch, state, key32) in the ring buffer itself:
+	- The epoch lets us know if an item comes before or after us. A generational index by any other name.
+	- State lets us know if it's a special key (like an exclusive lock)
+	- Key lets us find conflicting items for regular threads
 
 The operations are pretty much what you'd do for a ringbuffer, but
 with a bitfield free-list:
