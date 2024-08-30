@@ -30,7 +30,7 @@ Internally, a roundabout is just a fancy ring buffer:
 	- The epoch is the next free rb_cell
 	- The bitfield tracks which items are allocated in the ring buffer
 	- The flags are passed on to mutator threads allocating
-- There's items of (epoch, state, lane) in the ring buffer itself:
+- There's items of (epoch, kind, lane) in the ring buffer itself:
 	- The epoch lets us know if an item comes before or after us. A generational index by any other name.
 	- State lets us know if it's a special lane (like an exclusive lock)
 	- Key lets us find conflicting items for regular threads
@@ -46,8 +46,8 @@ with a bitfield free-list:
 	- If the epoch is what we expect for an earlier item, check it
 	- Spin if there's a conflict
 - Freeing is
-	- Replace item with (epoch+width, free_state, 0)
-	- This lets later writers skip the entry, or spin until it's allocated
+	- Replace item with (epoch+width, free_kind, 0)
+	- This lets later writers skip the cell, or spin until it's allocated
 	- CAS in a new header with the bitfield updated
 
 This allows a roundabout to be used in a number of different ways:
@@ -79,9 +79,12 @@ acquire multiple entries on the ring buffer is atomically.
 
 This is why push/pop/etc aren't public methods.
 
+Oh, wait, no there's another downside: A thread shouldn't nest calls to SpinLock,
+etc. That's a bad idea and will lock up the log entirely.
+
 */
 
-// roundabout cell states
+// roundabout cell kind
 const (
 	ZeroCell uint16 = iota // unset memory
 	FreeCell
@@ -97,7 +100,7 @@ const (
 	// We could also have SpinPrefix or SpinLe / SpinGe
 	// to vary key matching rules.
 
-	// a <entry type><key type> encoding might go a long way
+	// a <cell type><key type> encoding might go a long way
 	// but there doesn't seem to be any genuine use cases
 	// outside of "read/write" and "unallocated" / "uninitialised"
 )
@@ -105,39 +108,39 @@ const (
 // the header of the ring buffer
 
 type Header struct {
-	epoch uint16
-	state uint16
-	body  uint32
+	epoch  uint16
+	flags  uint16
+	bitmap uint32
 }
 
 func (h Header) pack() uint64 {
-	return (uint64(h.epoch) << 48) | (uint64(h.state) << 32) | uint64(h.body)
+	return (uint64(h.epoch) << 48) | (uint64(h.flags) << 32) | uint64(h.bitmap)
 }
 
 func unpackHeader(h uint64) Header {
 	var epoch uint16 = uint16((h >> 48) & 65535)
-	var state uint16 = uint16((h >> 32) & 65535)
-	var body uint32 = uint32(h & 2147483647)
-	return Header{epoch, state, body}
+	var flags uint16 = uint16((h >> 32) & 65535)
+	var bitmap uint32 = uint32(h & 2147483647)
+	return Header{epoch, flags, bitmap}
 }
 
 // the entries in the ring buffers
 
 type Cell struct {
 	epoch uint16
-	state uint16
-	body  uint32
+	kind  uint16
+	lane  uint32
 }
 
 func (c Cell) pack() uint64 {
-	return (uint64(c.epoch) << 48) | (uint64(c.state) << 32) | uint64(c.body)
+	return (uint64(c.epoch) << 48) | (uint64(c.kind) << 32) | uint64(c.lane)
 }
 
 func unpackCell(h uint64) Cell {
 	var epoch uint16 = uint16((h >> 48) & 65535)
-	var state uint16 = uint16((h >> 32) & 65535)
-	var body uint32 = uint32(h & 2147483647)
-	return Cell{epoch, state, body}
+	var kind uint16 = uint16((h >> 32) & 65535)
+	var lane uint32 = uint32(h & 2147483647)
+	return Cell{epoch, kind, lane}
 }
 
 // a cell in use in the roundabout
@@ -145,7 +148,7 @@ type rb_cell struct {
 	n      int
 	epoch  uint16
 	flags  uint16
-	state  uint16
+	kind  uint16
 	lane   uint32
 	bitmap uint32
 }
@@ -163,7 +166,7 @@ type rb_fence struct {
 
 type Roundabout struct {
 	header   atomic.Uint64     // <epoch:16> <flags:16> <bitmap: 32>
-	log      [32]atomic.Uint64 // <epoch:16> <state:16> <lane: 32>
+	log      [32]atomic.Uint64 // <epoch:16> <kind:16> <lane: 32>
 	Conflict func(uint32, uint32) bool
 }
 
@@ -174,15 +177,15 @@ func (rb *Roundabout) Epoch() uint16 {
 
 func (rb *Roundabout) Flags() uint16 {
 	h := unpackHeader(rb.header.Load())
-	return h.state
+	return h.flags
 }
 
 func (rb *Roundabout) String() string {
 	h := unpackHeader(rb.header.Load())
 	return fmt.Sprintf("%v [%v] %v",
-		strconv.FormatUint(uint64(h.body), 2),
+		strconv.FormatUint(uint64(h.bitmap), 2),
 		h.epoch,
-		strconv.FormatUint(uint64(h.state), 2),
+		strconv.FormatUint(uint64(h.flags), 2),
 	)
 }
 
@@ -198,14 +201,14 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 	}
 
 	e := int(h.epoch) - 1
-	bitmap := bits.RotateLeft32(h.body, int(e)%width)
+	bitmap := bits.RotateLeft32(h.bitmap, int(e)%width)
 	match := false
 	for i := 0; i < 32; i++ {
 		if e == int(epoch) {
 			match = true
 		}
 		// don't need to read epoch values as if there was a 1
-		// it was an earlier log entry
+		// it was an earlier log cell
 		if match {
 			if bitmap&1 == 1 {
 				return false
@@ -218,11 +221,11 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 
 }
 
-// push a new item onto the log, with a given lane and state
-// the state is "Spin" or "SpinAll", and the lane is usually
+// push a new item onto the log, with a given lane and kind
+// the kind is "Spin" or "SpinAll", and the lane is usually
 // some hash value
 
-func (rb *Roundabout) push(lane uint32, state uint16) (rb_cell, bool) {
+func (rb *Roundabout) push(lane uint32, kind uint16) (rb_cell, bool) {
 	header := rb.header.Load()
 
 	h := unpackHeader(header)
@@ -230,19 +233,19 @@ func (rb *Roundabout) push(lane uint32, state uint16) (rb_cell, bool) {
 	n := int(h.epoch) % width
 	var b uint32 = 1 << n
 
-	if h.body&b == 0 {
-		new_header := Header{h.epoch + 1, h.state, h.body | b}.pack()
-		item := Cell{h.epoch, state, lane}.pack()
+	if h.bitmap&b == 0 {
+		new_header := Header{h.epoch + 1, h.flags, h.bitmap | b}.pack()
+		item := Cell{h.epoch, kind, lane}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			rb.log[n].Store(item)
 			e := rb_cell{
 				n:      n,
 				epoch:  h.epoch,
-				flags:  h.state,
-				state:  state,
+				flags:  h.flags,
+				kind:   kind,
 				lane:   lane,
-				bitmap: h.body,
+				bitmap: h.bitmap,
 			}
 			return e, true
 
@@ -283,7 +286,7 @@ func (rb *Roundabout) wait(r rb_cell) {
 		n := int(epoch) % width
 		for true {
 			item := unpackCell(rb.log[n].Load())
-			if item.state == ZeroCell {
+			if item.kind == ZeroCell {
 				// spin, uninitialised memory
 				continue
 			} else if item.epoch == epoch {
@@ -291,43 +294,43 @@ func (rb *Roundabout) wait(r rb_cell) {
 				// has been allocated on bitmap
 				// check cell has been written
 
-				if item.state == FreeCell {
-					// the log entry has been allocated in the bitmap
+				if item.kind == FreeCell {
+					// the log cell has been allocated in the bitmap
 					// but the thread has yet to write to it, so spin
 					continue
-				} else if r.state == SpinAllCell {
+				} else if r.kind == SpinAllCell {
 					// we're a SpinAll, we
 					// wait for all predecessors
 					continue
-				} else if item.state == SpinAllCell {
+				} else if item.kind == SpinAllCell {
 					// we've met a spinall, so we wait for it
 					continue
-				} else if r.state == ReadAllCell {
-					if item.state == ReadCell || item.state == ReadAllCell {
+				} else if r.kind == ReadAllCell {
+					if item.kind == ReadCell || item.kind == ReadAllCell {
 						break
 					}
 					// we're a readall, and we encounted a not-read
 					// so spin
 					continue
-				} else if item.state == ReadAllCell {
-					if r.state == ReadCell || r.state == ReadAllCell {
+				} else if item.kind == ReadAllCell {
+					if r.kind == ReadCell || r.kind == ReadAllCell {
 						break
 					}
 					// we're a a not-read, and we encounterd a read all
 					// so spin
 					continue
 
-				} else if r.state == ReadCell && item.state == ReadCell {
+				} else if r.kind == ReadCell && item.kind == ReadCell {
 					// ReadCells can only conflict with not-reads
 					break
 					// we only spin if the lane matches
 				}
 
 				if rb.Conflict == nil {
-					if r.lane == item.body {
+					if r.lane == item.lane {
 						continue
 					}
-				} else if rb.Conflict(r.lane, item.body) {
+				} else if rb.Conflict(r.lane, item.lane) {
 					continue
 				}
 			}
@@ -354,19 +357,19 @@ func (rb *Roundabout) setFence(flags uint16) (rb_fence, bool) {
 	header := rb.header.Load()
 	h := unpackHeader(header)
 
-	if h.state&flags != 0 {
+	if h.flags&flags != 0 {
 		// can't set flags, already set
 		return rb_fence{}, false
 	}
 
-	new_header := Header{h.epoch, h.state | flags, h.body}.pack()
+	new_header := Header{h.epoch, h.flags | flags, h.bitmap}.pack()
 
 	if rb.header.CompareAndSwap(header, new_header) {
 		s := rb_fence{
 			epoch:     h.epoch,
 			flags:     flags,
-			new_flags: h.state | flags,
-			bitmap:    h.body,
+			new_flags: h.flags | flags,
+			bitmap:    h.bitmap,
 		}
 		return s, true
 	}
@@ -405,7 +408,7 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 		n := int(epoch) % width
 		for true {
 			item := unpackCell(rb.log[n].Load())
-			if item.state == ZeroCell {
+			if item.kind == ZeroCell {
 				// spin, uninitialised memory
 				continue
 			} else if item.epoch == epoch {
@@ -428,7 +431,7 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 		header := rb.header.Load()
 		h := unpackHeader(header)
 
-		new_header := Header{h.epoch, h.state ^ s.flags, h.body}.pack()
+		new_header := Header{h.epoch, h.flags ^ s.flags, h.bitmap}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			return h.epoch
