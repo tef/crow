@@ -1,6 +1,8 @@
 # Concurrent Readers, Ordered Writers
 
-A work in progress.
+A work in progress. This library may eventually contain examples
+of concurrent data structures, but for now it only contains
+the mechanims to build them.
 
 ## Roundabouts
 
@@ -53,7 +55,10 @@ r.Phase(flags, func(epoch uint16, flags uint16) error {
 
 ```
 
-Despite being a log, a roundabout sits between "fine grained locks" and "one big lock". A Roundabout to be used in a number of different ways:
+The lane passed to a lock gets written into the log buffer, and the other threads compare
+it against their own lane, and type, to know if to spin or if it is safe to continue on
+while the other thread is active. This allows a roundabout to offer something a little
+bit like locking, in several different flavours:
 
 - Like a single, big lock, `r.SpinLockAll(...)`
 	- The mutator threads spin until all predecessors are complete
@@ -66,7 +71,7 @@ Despite being a log, a roundabout sits between "fine grained locks" and "one big
 
 - Like a fine grained lock, `r.SpinLock(lane, ...)`
 	- Each thread inserts a 32bit lane, and spins if there's a match
-    - If they encounter a big lock, they wait for it 
+    - If they encounter a big lock, they wait for it
     - There's also `r.SpinRead(lane, ...)` which only conflict with writes of the same key
 
 - Like Read-Copy-Update, `r.Fence()`, `r.Phase()`
@@ -80,7 +85,15 @@ Despite being a log, a roundabout sits between "fine grained locks" and "one big
     - Can check if epoch has advanced, or all earlier writers have exited
     - Can be used to reclaim shared structures, or keep thread local free lists
 
-Underneath, it's comprised of a ring buffer of work items, using a bitfield instead of a count to manage freeing items. This allows us to do some not very ring buffer things like removing arbitrary items from the list, but it also limits us to having a quite small ringbuffer.
+It is important to note that it really isn't a lock. It's a log.  Each log entry represents a complete operation that a thread intends to carry out. In other words, each thread should only take up one entry in the log. Trying to allocate a spinlock inside a spinlock, for example, would stop the log from being emptied out, and potentially forcing
+a deadlock.
+
+Aside: If an operation requires locking over two lanes, you'd need to allocate two entries
+at the same time, and that has an awful lot of edge cases. It's easier to cram things into a uint32 and pass in a custom Conflict function to test them.
+
+The big reason for this is that the log is represented by a fixed sized ring buffer, rather than a series of linked lists, which is a bit of a tradeoff, but it makes several operations much faster, primarily scanning over current log entries, as well as deleting log entries.
+
+It's really just a fancy ring buffer.
 
 - There's a header of (epoch, flags, bitfield32)
 	- The epoch is the next free slot
