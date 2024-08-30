@@ -77,10 +77,9 @@ The one major downside? If a thread tries to obtain multiple entries on the log,
 it might succeed, but under contention it will lock hard. The only way to safely
 acquire multiple entries on the ring buffer is atomically.
 
-This is why push/pop/etc aren't public methods.
+This is why push/pop/etc aren't public methods. A thread shouldn't nest calls
+to SpinLock etc but our hands are tied in go, alas.
 
-Oh, wait, no there's another downside: A thread shouldn't nest calls to SpinLock,
-etc. That's a bad idea and will lock up the log entirely.
 
 */
 
@@ -148,7 +147,7 @@ type rb_cell struct {
 	n      int
 	epoch  uint16
 	flags  uint16
-	kind  uint16
+	kind   uint16
 	lane   uint32
 	bitmap uint32
 }
@@ -192,32 +191,30 @@ func (rb *Roundabout) String() string {
 func (rb *Roundabout) Active(epoch uint16) bool {
 	h := unpackHeader(rb.header.Load())
 
-	// only active epochs are e-32, e-31 ... e-1
-	if epoch < (h.epoch-width) && epoch < h.epoch {
-		return true
-	}
-	if epoch > h.epoch && epoch < (h.epoch-width) {
-		return true
+	if h.epoch == epoch {
+		return h.bitmap == 0
 	}
 
-	e := int(h.epoch) - 1
-	bitmap := bits.RotateLeft32(h.bitmap, int(e)%width)
-	match := false
-	for i := 0; i < 32; i++ {
-		if e == int(epoch) {
-			match = true
-		}
-		// don't need to read epoch values as if there was a 1
-		// it was an earlier log cell
-		if match {
-			if bitmap&1 == 1 {
-				return false
-			}
+	// if we're within width bits, epoch could have
+	// active predecessors
+
+	diff := h.epoch - epoch
+
+	if diff < 0 || diff >= width {
+		return false
+	}
+
+	// skim off all bits of jobs ahead of epoch given
+	bitmap := bits.RotateLeft32(h.bitmap, int(h.epoch-1)%width)
+	bitmap = bitmap >> diff
+
+	for i := 0; i < width-int(diff); i++ {
+		if bitmap&1 == 1 {
+			return true
 		}
 		bitmap = bitmap >> 1
-		e--
 	}
-	return true
+	return false
 
 }
 
