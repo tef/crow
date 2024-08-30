@@ -11,10 +11,10 @@ A roundabout can be used for big locks, fine grained locks, reader-writer locks,
 ```
 r := Roundabout{}
 
-var key uint32 = 12234
-r.SpinLock(key, func(epoch uint16, flags uint16) error {
+var lane uint32 = 12234
+r.SpinLock(lane, func(epoch uint16, flags uint16) error {
     // this callback will never be invoked while other callbacks
-    // are running with the same key
+    // are running with the same lane
 
     ...
 })
@@ -26,9 +26,9 @@ r.SpinLockAll(func(epoch uint16, flags uint16) error{
     ...
 })
 
-r.SpinRead(key, func(epoch uint16, flags uint16) error {
+r.SpinRead(lane, func(epoch uint16, flags uint16) error {
     // this callback will never be invoked while other callbacks
-    // are running with the same key, unless those are also SpinReads
+    // are running with the same lane, unless those are also SpinReads
     ...
 })
 
@@ -55,23 +55,30 @@ r.Phase(flags, func(epoch uint16, flags uint16) error {
 
 Despite being a log, a roundabout sits between "fine grained locks" and "one big lock". A Roundabout to be used in a number of different ways:
 
-- Like a fine grained lock, `r.SpinLock(key, ...)`
-	- Each thread inserts a 32bit key, and spins if there's a match
 - Like a single, big lock, `r.SpinLockAll(...)`
 	- The mutator threads spin until all predecessors are complete
 	- Succesor threads spin when encountering a big lock in the log
-- Like a reader, writer lock, `r.SpinRead(key, ...)`
-	- Readers create conflict free log items
-	- Only writers force mutual exclusion
-- Like an optimistic read lock, `r.Epoch()`
-	- Checking the epoch before and after reads to check for changes
-- Like an epoch based reclaimer, `r.Fence()`, `r.Phase()`
-    - The buffer has an `uint16` of flags for user use. This gets passed into all SpinLocks
-	- Changing the header affects all subsequent writers, but not previous ones.
-	- Unlike `SpinLock`, doesn't block new writers
-	- Waits for all predecessor log entries to complete, runs callback
-	- Can be used to handle concurrent resizes or snapshots
+    - Unlike a normal lock, threads establish priority in who gets to go next
 
+- Like a reader, writer lock, `r.SpinReadAll(...)`
+    - If a SpinRead encounters another SpinRead, it continues on
+	- Only writers force mutual exclusion
+
+- Like a fine grained lock, `r.SpinLock(lane, ...)`
+	- Each thread inserts a 32bit lane, and spins if there's a match
+    - If they encounter a big lock, they wait for it 
+    - There's also `r.SpinRead(lane, ...)` which only conflict with writes of the same key
+
+- Like Read-Copy-Update, `r.Fence()`, `r.Phase()`
+    - A fence can be used to notify all future writers an operation is in progress, via a uint16 of flags
+    - A fence can wait for all earlier writers to exit before starting work
+    - Can be used to handle concurrent resizes or snapshots, without blocking writers
+
+- Like Optimistic Locks `r.Epoch()`, or Lock-Free-Reclamation
+    - Checking the epoch before and after reads to check for changes
+    - Can note down the epoch when a structure is retired
+    - Can check if epoch has advanced, or all earlier writers have exited
+    - Can be used to reclaim shared structures, or keep thread local free lists
 
 Underneath, it's comprised of a ring buffer of work items, using a bitfield instead of a count to manage freeing items. This allows us to do some not very ring buffer things like removing arbitrary items from the list, but it also limits us to having a quite small ringbuffer.
 
@@ -79,10 +86,10 @@ Underneath, it's comprised of a ring buffer of work items, using a bitfield inst
 	- The epoch is the next free slot
 	- The bitfield tracks which items are allocated in the ring buffer
 	- The flags are passed on to mutator threads allocating
-- There's items of (epoch, state, key32)
+- There's items of (epoch, state, lane32)
 	- The epoch lets us know if an item comes before or after us
-	- State lets us know if it's a special key
-	- Key lets us find conflicting items
+	- State indicates what sort of entry (Read, SpinAll, Free)
+	- Lane32 lets us find conflicting items
 - There's only 32 slots in the ring buffer
     - That's ok though, 32 is a pretty big number in terms of active CPUs
 

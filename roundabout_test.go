@@ -18,8 +18,8 @@ func TestRoundabout(t *testing.T) {
 
 	go func() {
 		t.Log("popping")
-		b.Phase(123, func() error {
-			t.Log("in signal", b.String())
+		b.Phase(123, func(epoch uint16, flags uint16) error {
+			t.Log("in phase start", b.String())
 			b2.pop(start)
 			b.push(1111, SpinCell)
 			return nil
@@ -61,7 +61,7 @@ func TestSpinLock(t *testing.T) {
 	r1, _ := b.push(1, SpinCell)
 	rX, _ := b.push(10, SpinCell)
 	rY, _ := b.push(10, SpinCell)
-	var r3 slot
+	var r3 rb_entry
 
 	var done bool
 	go func() {
