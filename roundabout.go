@@ -102,7 +102,7 @@ This is why push/pop/etc aren't public methods.
 
 // roundabout cell states
 const (
-	ZeroCell uint16 = iota
+	ZeroCell uint16 = iota // unset memory
 	FreeCell
 	SpinCell
 	SpinAllCell
@@ -112,7 +112,13 @@ const (
 
 	// We could also have AbortCell, AbortAllCell
 	// to force later writers to abandon work
-	// or other behaviour like Spin if Key doesn't match
+
+	// We could also have SpinPrefix or SpinLe / SpinGe
+	// to vary key matching rules.
+
+	// a <entry type><key type> encoding might go a long way
+	// but there doesn't seem to be any genuine use cases
+	// outside of "read/write" and "unallocated" / "uninitialised"
 )
 
 // a reserved rb_entry in the roundabout
@@ -134,10 +140,11 @@ type rb_fence struct {
 }
 
 // and the actual structure itself:
+// a ring buffer of log entries, and a header including epoch and freelist
 
 type Roundabout struct {
 	header   atomic.Uint64     // <epoch:16> <flags:16> <bitmap: 32>
-	cells    [32]atomic.Uint64 // <epoch:16> <state:16> <lane: 32>
+	log      [32]atomic.Uint64 // <epoch:16> <state:16> <lane: 32>
 	Conflict func(uint32, uint32) bool
 }
 
@@ -160,6 +167,37 @@ func (rb *Roundabout) String() string {
 	)
 }
 
+func (rb *Roundabout) Active(epoch uint32) bool {
+	h := unpack(rb.header.Load())
+
+	// only active epochs are e-32, e-31 ... e-1
+	if epoch < (h.epoch - width) && epoch < h.epoch {
+		return true
+	if epoch > h.epoch && epoch < (h.epoch-width) {
+		return true
+	}
+
+	e := int(rb.epoch) - 1
+	bitmap := bits.RotateLeft32(int(e)%width)
+	match := false
+	for i := 0; i++; i < 32 {
+		if e == int(epoch) {
+			match = true
+		}
+		// don't need to read epoch values as if there was a 1
+		// it was an earlier log entry
+		if match {
+			if b&1 == 1 {
+				return false
+			}
+		}
+		bitmap = bitmap >> 1
+		e--
+	}
+	return true
+
+}
+
 // push a new item onto the log, with a given lane and state
 // the state is "Spin" or "SpinAll", and the lane is usually
 // some hash value
@@ -177,7 +215,7 @@ func (rb *Roundabout) push(lane uint32, state uint16) (rb_entry, bool) {
 		item := packed{h.epoch, state, lane}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
-			rb.cells[n].Store(item)
+			rb.log[n].Store(item)
 			e := rb_entry{
 				n:      n,
 				epoch:  h.epoch,
@@ -224,7 +262,7 @@ func (rb *Roundabout) wait(r rb_entry) {
 
 		n := int(epoch) % width
 		for true {
-			item := unpack(rb.cells[n].Load())
+			item := unpack(rb.log[n].Load())
 			if item.state == ZeroCell {
 				// spin, uninitialised memory
 				continue
@@ -283,7 +321,7 @@ func (rb *Roundabout) wait(r rb_entry) {
 // before updating the header
 func (rb *Roundabout) pop(r rb_entry) {
 	next_item := packed{r.epoch + width, FreeCell, 0}.pack()
-	rb.cells[r.n].Store(next_item)
+	rb.log[r.n].Store(next_item)
 
 	var b uint64 = 1 << r.n
 	rb.header.And(^b) // go 1.23 needed
@@ -346,7 +384,7 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 
 		n := int(epoch) % width
 		for true {
-			item := unpack(rb.cells[n].Load())
+			item := unpack(rb.log[n].Load())
 			if item.state == ZeroCell {
 				// spin, uninitialised memory
 				continue
@@ -384,6 +422,9 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
 		rb_entry, ok := rb.push(lane, SpinCell)
+		// XXX could count the spins here
+		// and park the thread
+
 		if !ok {
 			continue
 		}
