@@ -9,25 +9,6 @@ import (
 
 const width = 32
 
-// for packing and unpacking an int64 into three parts
-
-type packed struct {
-	epoch uint16
-	state uint16
-	body  uint32
-}
-
-func (c packed) pack() uint64 {
-	return (uint64(c.epoch) << 48) | (uint64(c.state) << 32) | uint64(c.body)
-}
-
-func unpack(h uint64) packed {
-	var epoch uint16 = uint16((h >> 48) & 65535)
-	var state uint16 = uint16((h >> 32) & 65535)
-	var body uint32 = uint32(h & 2147483647)
-	return packed{epoch, state, body}
-}
-
 /*
 A roundabout is effectively an in-memory write-ahead log:
 
@@ -46,7 +27,7 @@ This allows a roundabout to be used for mutual exclusion, as well as coordinatio
 Internally, a roundabout is just a fancy ring buffer:
 
 - There's a header of (epoch, flags, bitfield32)
-	- The epoch is the next free rb_entry
+	- The epoch is the next free rb_cell
 	- The bitfield tracks which items are allocated in the ring buffer
 	- The flags are passed on to mutator threads allocating
 - There's items of (epoch, state, lane) in the ring buffer itself:
@@ -121,8 +102,46 @@ const (
 	// outside of "read/write" and "unallocated" / "uninitialised"
 )
 
-// a reserved rb_entry in the roundabout
-type rb_entry struct {
+// the header of the ring buffer
+
+type Header struct {
+	epoch uint16
+	state uint16
+	body  uint32
+}
+
+func (h Header) pack() uint64 {
+	return (uint64(h.epoch) << 48) | (uint64(h.state) << 32) | uint64(h.body)
+}
+
+func unpackHeader(h uint64) Header {
+	var epoch uint16 = uint16((h >> 48) & 65535)
+	var state uint16 = uint16((h >> 32) & 65535)
+	var body uint32 = uint32(h & 2147483647)
+	return Header{epoch, state, body}
+}
+
+// the entries in the ring buffers
+
+type Cell struct {
+	epoch uint16
+	state uint16
+	body  uint32
+}
+
+func (c Cell) pack() uint64 {
+	return (uint64(c.epoch) << 48) | (uint64(c.state) << 32) | uint64(c.body)
+}
+
+func unpackCell(h uint64) Cell {
+	var epoch uint16 = uint16((h >> 48) & 65535)
+	var state uint16 = uint16((h >> 32) & 65535)
+	var body uint32 = uint32(h & 2147483647)
+	return Cell{epoch, state, body}
+}
+
+// a cell in use in the roundabout
+type rb_cell struct {
 	n      int
 	epoch  uint16
 	flags  uint16
@@ -149,17 +168,17 @@ type Roundabout struct {
 }
 
 func (rb *Roundabout) Epoch() uint16 {
-	h := unpack(rb.header.Load())
+	h := unpackHeader(rb.header.Load())
 	return h.epoch
 }
 
 func (rb *Roundabout) Flags() uint16 {
-	h := unpack(rb.header.Load())
+	h := unpackHeader(rb.header.Load())
 	return h.state
 }
 
 func (rb *Roundabout) String() string {
-	h := unpack(rb.header.Load())
+	h := unpackHeader(rb.header.Load())
 	return fmt.Sprintf("%v [%v] %v",
 		strconv.FormatUint(uint64(h.body), 2),
 		h.epoch,
@@ -167,27 +186,28 @@ func (rb *Roundabout) String() string {
 	)
 }
 
-func (rb *Roundabout) Active(epoch uint32) bool {
-	h := unpack(rb.header.Load())
+func (rb *Roundabout) Active(epoch uint16) bool {
+	h := unpackHeader(rb.header.Load())
 
 	// only active epochs are e-32, e-31 ... e-1
-	if epoch < (h.epoch - width) && epoch < h.epoch {
+	if epoch < (h.epoch-width) && epoch < h.epoch {
 		return true
+	}
 	if epoch > h.epoch && epoch < (h.epoch-width) {
 		return true
 	}
 
-	e := int(rb.epoch) - 1
-	bitmap := bits.RotateLeft32(int(e)%width)
+	e := int(h.epoch) - 1
+	bitmap := bits.RotateLeft32(h.body, int(e)%width)
 	match := false
-	for i := 0; i++; i < 32 {
+	for i := 0; i < 32; i++ {
 		if e == int(epoch) {
 			match = true
 		}
 		// don't need to read epoch values as if there was a 1
 		// it was an earlier log entry
 		if match {
-			if b&1 == 1 {
+			if bitmap&1 == 1 {
 				return false
 			}
 		}
@@ -202,21 +222,21 @@ func (rb *Roundabout) Active(epoch uint32) bool {
 // the state is "Spin" or "SpinAll", and the lane is usually
 // some hash value
 
-func (rb *Roundabout) push(lane uint32, state uint16) (rb_entry, bool) {
+func (rb *Roundabout) push(lane uint32, state uint16) (rb_cell, bool) {
 	header := rb.header.Load()
 
-	h := unpack(header)
+	h := unpackHeader(header)
 
 	n := int(h.epoch) % width
 	var b uint32 = 1 << n
 
 	if h.body&b == 0 {
-		new_header := packed{h.epoch + 1, h.state, h.body | b}.pack()
-		item := packed{h.epoch, state, lane}.pack()
+		new_header := Header{h.epoch + 1, h.state, h.body | b}.pack()
+		item := Cell{h.epoch, state, lane}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			rb.log[n].Store(item)
-			e := rb_entry{
+			e := rb_cell{
 				n:      n,
 				epoch:  h.epoch,
 				flags:  h.state,
@@ -229,13 +249,13 @@ func (rb *Roundabout) push(lane uint32, state uint16) (rb_entry, bool) {
 		}
 	}
 
-	return rb_entry{}, false
+	return rb_cell{}, false
 }
 
-// after allocating a rb_entry on the roundabout, we scan predecessors
+// after allocating a rb_cell on the roundabout, we scan predecessors
 // to find conflicts
 
-func (rb *Roundabout) wait(r rb_entry) {
+func (rb *Roundabout) wait(r rb_cell) {
 	// n.b we will never scan epoch -32 to 0 for the first cycle
 	// as the bitmap in the header is all zeros
 
@@ -262,7 +282,7 @@ func (rb *Roundabout) wait(r rb_entry) {
 
 		n := int(epoch) % width
 		for true {
-			item := unpack(rb.log[n].Load())
+			item := unpackCell(rb.log[n].Load())
 			if item.state == ZeroCell {
 				// spin, uninitialised memory
 				continue
@@ -319,8 +339,8 @@ func (rb *Roundabout) wait(r rb_entry) {
 
 // mark our work as complete, updating the item in the buffer
 // before updating the header
-func (rb *Roundabout) pop(r rb_entry) {
-	next_item := packed{r.epoch + width, FreeCell, 0}.pack()
+func (rb *Roundabout) pop(r rb_cell) {
+	next_item := Cell{r.epoch + width, FreeCell, 0}.pack()
 	rb.log[r.n].Store(next_item)
 
 	var b uint64 = 1 << r.n
@@ -332,14 +352,14 @@ func (rb *Roundabout) pop(r rb_entry) {
 
 func (rb *Roundabout) setFence(flags uint16) (rb_fence, bool) {
 	header := rb.header.Load()
-	h := unpack(header)
+	h := unpackHeader(header)
 
 	if h.state&flags != 0 {
 		// can't set flags, already set
 		return rb_fence{}, false
 	}
 
-	new_header := packed{h.epoch, h.state | flags, h.body}.pack()
+	new_header := Header{h.epoch, h.state | flags, h.body}.pack()
 
 	if rb.header.CompareAndSwap(header, new_header) {
 		s := rb_fence{
@@ -384,7 +404,7 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 
 		n := int(epoch) % width
 		for true {
-			item := unpack(rb.log[n].Load())
+			item := unpackCell(rb.log[n].Load())
 			if item.state == ZeroCell {
 				// spin, uninitialised memory
 				continue
@@ -406,9 +426,9 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 	for true {
 		header := rb.header.Load()
-		h := unpack(header)
+		h := unpackHeader(header)
 
-		new_header := packed{h.epoch, h.state ^ s.flags, h.body}.pack()
+		new_header := Header{h.epoch, h.state ^ s.flags, h.body}.pack()
 
 		if rb.header.CompareAndSwap(header, new_header) {
 			return h.epoch
@@ -421,7 +441,7 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 // run the callback when no other callbacks with the same lane are active
 func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_entry, ok := rb.push(lane, SpinCell)
+		rb_cell, ok := rb.push(lane, SpinCell)
 		// XXX could count the spins here
 		// and park the thread
 
@@ -429,10 +449,10 @@ func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error
 			continue
 		}
 
-		rb.wait(rb_entry)
-		defer rb.pop(rb_entry)
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
 
-		return fn(rb_entry.epoch, rb_entry.flags)
+		return fn(rb_cell.epoch, rb_cell.flags)
 	}
 	// huh
 	return nil
@@ -441,15 +461,15 @@ func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error
 // run the callback once all other callbacks have ended, regardless of lane
 func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 	for true {
-		rb_entry, ok := rb.push(0, SpinAllCell)
+		rb_cell, ok := rb.push(0, SpinAllCell)
 		if !ok {
 			continue
 		}
 
-		rb.wait(rb_entry)
-		defer rb.pop(rb_entry)
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
 		// maybe think about passing in epoch and flags
-		return fn(rb_entry.epoch, rb_entry.flags)
+		return fn(rb_cell.epoch, rb_cell.flags)
 	}
 	// huh
 	return nil
@@ -459,15 +479,15 @@ func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 // except other readers
 func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_entry, ok := rb.push(lane, ReadCell)
+		rb_cell, ok := rb.push(lane, ReadCell)
 		if !ok {
 			continue
 		}
 
-		rb.wait(rb_entry)
-		defer rb.pop(rb_entry)
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
 
-		return fn(rb_entry.epoch, rb_entry.flags)
+		return fn(rb_cell.epoch, rb_cell.flags)
 	}
 	// huh
 	return nil
@@ -477,15 +497,15 @@ func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error
 // except other readers
 func (rb *Roundabout) SpinReadAll(fn func(uint16, uint16) error) error {
 	for true {
-		rb_entry, ok := rb.push(0, ReadAllCell)
+		rb_cell, ok := rb.push(0, ReadAllCell)
 		if !ok {
 			continue
 		}
 
-		rb.wait(rb_entry)
-		defer rb.pop(rb_entry)
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
 
-		return fn(rb_entry.epoch, rb_entry.flags)
+		return fn(rb_cell.epoch, rb_cell.flags)
 	}
 	// huh
 	return nil

@@ -61,7 +61,7 @@ func TestSpinLock(t *testing.T) {
 	r1, _ := b.push(1, SpinCell)
 	rX, _ := b.push(10, SpinCell)
 	rY, _ := b.push(10, SpinCell)
-	var r3 rb_entry
+	var r3 rb_cell
 
 	var done bool
 	go func() {
