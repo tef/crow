@@ -1,4 +1,4 @@
-package roundabout
+package crow
 
 import (
 	"fmt"
@@ -97,7 +97,8 @@ const (
 	// to force later writers to abandon work
 
 	// We could also have SpinPrefix or SpinLe / SpinGe
-	// to vary key matching rules.
+	// to vary key matching rules, but it doesn't really
+	// handle priority: new entries do not block old ones
 
 	// a <cell type><key type> encoding might go a long way
 	// but there doesn't seem to be any genuine use cases
