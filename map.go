@@ -1,7 +1,7 @@
 package crow
 
 import (
-// "fmt"
+	"sync/atomic"
 )
 
 // note, CompareAndSwap(key, nil, new), key must exist
@@ -149,3 +149,40 @@ func (m *LockedMap) Clear() {
 		return nil
 	})
 }
+
+// sync.Map style, with an unlocked read only copy
+
+type map_entry struct {
+	value atomic.Value
+}
+
+type ReadWriteMap struct {
+	rb    Roundabout
+	read  atomic.Pointer[map[any]*map_entry]
+	write map[any]*map_entry
+}
+
+/*
+	read
+		load from read, check for dead or nil entry
+		if miss, SpinReadAll() on write
+	insert
+		load from read, check for expunged record, if so,
+		insert it into write, and unexpunge it
+		else create new and insert into write
+	delete
+		if in read, atomically update value
+		if not in read, SpinWriteAll to check write
+			and delete value with nil - can't delete unless we're sure it's not in read
+	update
+		if in read, atomically update value
+		if in write, SpinWriteAll ..
+
+	on several misses
+		move write into read, maybe deleting old values
+	on insert
+		copy read into write, skipping deleted record, marking them as dead
+
+	could have a map of deleted[key] in the write bit
+
+*/

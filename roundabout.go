@@ -85,13 +85,24 @@ to SpinLock etc but our hands are tied in go, alas.
 
 // roundabout cell kind
 const (
-	ZeroCell uint16 = iota // unset memory
-	FreeCell
-	SpinCell
-	SpinAllCell
+	ZeroCell    uint16 = iota // unitialised memory, all 0
+	PendingCell               // epoch set, kind pending
 
-	ReadCell
-	ReadAllCell
+	ReadLane // Blocks Writes in Lane
+	ReadAll  // Blocks Writes
+
+	AtomicLane // Doesn't block reads, blocks any Atomic or Write in lane
+	AtomicAll  // Doesn't block reads, blocks any Atomic or Write
+
+	WriteLane // Blocks all reads, writes in lane
+	WriteAll  // Blocks all reads, writes
+
+	/*
+		for example, on a hash table of string, atomic.Value
+		readall would allow concurrent reads, atomicall would allow
+		for atomic updates of values, but not create/delete, and writeall
+		would be needed for create/delete
+	*/
 
 	// We could also have AbortCell, AbortAllCell
 	// to force later writers to abandon work
@@ -292,37 +303,65 @@ func (rb *Roundabout) wait(r rb_cell) {
 				// has been allocated on bitmap
 				// check cell has been written
 
-				if item.kind == FreeCell {
+				if item.kind == PendingCell {
 					// the log cell has been allocated in the bitmap
 					// but the thread has yet to write to it, so spin
 					continue
-				} else if r.kind == SpinAllCell {
-					// we're a SpinAll, we
-					// wait for all predecessors
+				}
+
+				if r.kind == WriteAll || item.kind == WriteAll {
+					// we wait for all predecessors
 					continue
-				} else if item.kind == SpinAllCell {
-					// we've met a spinall, so we wait for it
-					continue
-				} else if r.kind == ReadAllCell {
-					if item.kind == ReadCell || item.kind == ReadAllCell {
+				} else if r.kind == AtomicAll {
+					// atomics not blocked by reads
+					if item.kind == ReadLane || item.kind == ReadAll {
 						break
 					}
-					// we're a readall, and we encounted a not-read
-					// so spin
-					continue
-				} else if item.kind == ReadAllCell {
-					if r.kind == ReadCell || r.kind == ReadAllCell {
-						break
-					}
-					// we're a a not-read, and we encounterd a read all
-					// so spin
+					// we block on all write predecessors
+					// and atomics
 					continue
 
-				} else if r.kind == ReadCell && item.kind == ReadCell {
-					// ReadCells can only conflict with not-reads
+				} else if r.kind == ReadAll {
+					// we block when we see a write, but not atomics
+					if item.kind == WriteLane || item.kind == WriteAll {
+						continue
+					}
 					break
-					// we only spin if the lane matches
+				} else if r.kind == WriteLane {
+					// block on all wide actions
+					if item.kind == WriteAll || item.kind == AtomicAll || item.kind == ReadAll {
+						continue
+					}
+					// check lane below for WriteLane, AtomicLane, ReadLane
+
+				} else if r.kind == AtomicLane {
+					// block on all wide actions, except reads
+					if item.kind == WriteAll || item.kind == AtomicAll {
+						continue
+					}
+					// ignore reads
+					if item.kind == ReadLane || item.kind == ReadAll {
+						break
+					}
+					// check lane for WriteLane, AtomicLane
+
+				} else if r.kind == ReadLane {
+					// blocked by any write
+					if item.kind == WriteAll {
+						continue
+					}
+					// ignores atomics, reads
+					if item.kind == AtomicLane || item.kind == AtomicAll {
+						break
+					}
+					if item.kind == ReadLane || item.kind == ReadAll {
+						break
+					}
+					// check lane for WriteLane below
 				}
+				// if we're an write lane, we check write, atomic, read lane here
+				// if we're an atomic lane, we check write, atomic lane here
+				// if we're a read lane, we check write lane here
 
 				if rb.Conflict == nil {
 					if r.lane == item.lane {
@@ -341,7 +380,7 @@ func (rb *Roundabout) wait(r rb_cell) {
 // mark our work as complete, updating the item in the buffer
 // before updating the header
 func (rb *Roundabout) pop(r rb_cell) {
-	next_item := Cell{r.epoch + width, FreeCell, 0}.pack()
+	next_item := Cell{r.epoch + width, PendingCell, 0}.pack()
 	rb.log[r.n].Store(next_item)
 
 	var b uint64 = 1 << r.n
@@ -411,6 +450,14 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 				continue
 			} else if item.epoch == epoch {
 				// spin, predecessor still active
+				// unless it's a read, which we can ignore
+				// may want to have diff fence or spinWriters
+				// but cant think of why we'd need a fence that waits
+				// for old readers that wouldn't be a writeall
+
+				if item.kind == ReadLane || item.kind == ReadAll {
+					break
+				}
 				continue
 			}
 
@@ -442,7 +489,7 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 // run the callback when no other callbacks with the same lane are active
 func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, SpinCell)
+		rb_cell, ok := rb.push(lane, WriteLane)
 		// XXX could count the spins here
 		// and park the thread
 
@@ -462,7 +509,7 @@ func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error
 // run the callback once all other callbacks have ended, regardless of lane
 func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, SpinAllCell)
+		rb_cell, ok := rb.push(0, WriteAll)
 		if !ok {
 			continue
 		}
@@ -480,7 +527,7 @@ func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 // except other readers
 func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, ReadCell)
+		rb_cell, ok := rb.push(lane, ReadLane)
 		if !ok {
 			continue
 		}
@@ -498,7 +545,7 @@ func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error
 // except other readers
 func (rb *Roundabout) SpinReadAll(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, ReadAllCell)
+		rb_cell, ok := rb.push(0, ReadAll)
 		if !ok {
 			continue
 		}
