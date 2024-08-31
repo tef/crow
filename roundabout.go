@@ -88,14 +88,14 @@ const (
 	ZeroCell    uint16 = iota // unitialised memory, all 0
 	PendingCell               // epoch set, kind pending
 
-	ReadLane // Blocks on Exclusive Writes in Lane, ignores SharedWrites, Reads
-	ReadAll  // Blocks on Any Exclusive Writes, ignores SharedWrites, Reads
+	ShareLane // Blocks on Locks, ignores Order and Share in lane
+	ShareRing  // Blocks on Locks, ignores Order and Share in ring
 
-	ShWriteLane // Blocks on any Write in Lane, ignores Reads
-	ShWriteAll  // Blocks on any Write, ignores Reads
+	OrderLane // Blocks on any Lock, Order in lane, ignores Share
+	OrderRing  // Blocks on any Lock, Order in ring, ignores Share
 
-	ExWriteLane // Blocks on all predecessors in lane
-	ExWriteAll  // Blocks on all predecessors
+	LockLane // Blocks on any predecessors in lane
+	LockRing  // Blocks on all predecessors in ring
 
 	/*
 		There is room for other behaviours, but a user
@@ -103,6 +103,9 @@ const (
 
 		In theory, we could make an entry that tells future
 		workers to abort, but flags already handle that case
+
+		we could encode this as <pending><shared><ordered><locked><lane/ring>
+		and speed up comparisons and checks but big meh
 	*/
 )
 
@@ -171,6 +174,12 @@ type Roundabout struct {
 	Conflict func(uint32, uint32) bool
 }
 
+// before you ask, yes, 32 isn't a lot of elements, but it is currently a lot of cpus
+// we could build a larger roundabout from a linked list/free list, or we could 
+// partition a larger ring into 32 buckets, give each one a bitmap, 
+// and do some special dancing to ensure we don't get a race from updating the header
+// + the bitmap at the same time
+
 func (rb *Roundabout) Epoch() uint16 {
 	h := unpackHeader(rb.header.Load())
 	return h.epoch
@@ -196,7 +205,7 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 	if h.epoch == epoch {
 		return h.bitmap == 0
 	}
-
+	
 	// if we're within width bits, epoch could have
 	// active predecessors
 
@@ -224,7 +233,7 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 }
 
 // push a new item onto the log, with a given lane and kind
-// the kind is "Spin" or "SpinAll", and the lane is usually
+// the kind is "Spin" or "SpinRing", and the lane is usually
 // some hash value
 
 func (rb *Roundabout) push(lane uint32, kind uint16) (rb_cell, bool) {
@@ -302,59 +311,59 @@ func (rb *Roundabout) wait(r rb_cell) {
 					continue
 				}
 
-				if r.kind == ExWriteAll || item.kind == ExWriteAll {
+				if r.kind == LockRing || item.kind == LockRing {
 					// we wait for all predecessors
 					continue
-				} else if r.kind == ShWriteAll {
+				} else if r.kind == OrderRing {
 					// atomics not blocked by reads
-					if item.kind == ReadLane || item.kind == ReadAll {
+					if item.kind == ShareLane || item.kind == ShareRing {
 						break
 					}
-					// we block on all write predecessors
+					// we block on all Lock, Order predecessors
 					// and atomics
 					continue
 
-				} else if r.kind == ReadAll {
-					// we block when we see a write, but not atomics
-					if item.kind == ExWriteLane || item.kind == ExWriteAll {
+				} else if r.kind == ShareRing {
+					// we block when we see a Lock, but not Share or Atomics
+					if item.kind == LockLane || item.kind == LockRing {
 						continue
 					}
 					break
-				} else if r.kind == ExWriteLane {
+				} else if r.kind == LockLane {
 					// block on all wide actions
-					if item.kind == ExWriteAll || item.kind == ShWriteAll || item.kind == ReadAll {
+					if item.kind == LockRing || item.kind == OrderRing || item.kind == ShareRing {
 						continue
 					}
-					// check lane below for ExWriteLane, ShWriteLane, ReadLane
+					// check lane below for LockLane, OrderLane, ShareLane
 
-				} else if r.kind == ShWriteLane {
+				} else if r.kind == OrderLane {
 					// block on all wide actions, except reads
-					if item.kind == ExWriteAll || item.kind == ShWriteAll {
+					if item.kind == LockRing || item.kind == OrderRing {
 						continue
 					}
 					// ignore reads
-					if item.kind == ReadLane || item.kind == ReadAll {
+					if item.kind == ShareLane || item.kind == ShareRing {
 						break
 					}
-					// check lane for ExWriteLane, ShWriteLane
+					// check lane for LockLane, OrderLane
 
-				} else if r.kind == ReadLane {
-					// blocked by any write
-					if item.kind == ExWriteAll {
+				} else if r.kind == ShareLane {
+					// blocked by any Lock
+					if item.kind == LockRing {
 						continue
 					}
 					// ignores atomics, reads
-					if item.kind == ShWriteLane || item.kind == ShWriteAll {
+					if item.kind == OrderLane || item.kind == OrderRing {
 						break
 					}
-					if item.kind == ReadLane || item.kind == ReadAll {
+					if item.kind == ShareLane || item.kind == ShareRing {
 						break
 					}
-					// check lane for ExWriteLane below
+					// check lane for LockLane below
 				}
-				// if we're an write lane, we check write, atomic, read lane here
-				// if we're an atomic lane, we check write, atomic lane here
-				// if we're a read lane, we check write lane here
+				// if we're a Lock lane, we chec Lock, atomic, read lane here
+				// if we're an atomic lane, we chec Lock, atomic lane here
+				// if we're a read lane, we chec Lock lane here
 
 				if rb.Conflict == nil {
 					if r.lane == item.lane {
@@ -446,9 +455,9 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 				// unless it's a read, which we can ignore
 				// may want to have diff fence or spinWriters
 				// but cant think of why we'd need a fence that waits
-				// for old readers that wouldn't be a writeall
+				// for old readers that wouldn't be a LockRing
 
-				if item.kind == ReadLane || item.kind == ReadAll {
+				if item.kind == ShareLane || item.kind == ShareRing {
 					break
 				}
 				continue
@@ -462,7 +471,7 @@ func (rb *Roundabout) spinFence(s rb_fence) {
 }
 
 // clear out flags, OR'ing out our changes
-// and again, only affecting new writers
+// and again, only affecting new threads
 
 func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 	for true {
@@ -480,9 +489,9 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 }
 
 // run the callback once all other callbacks have ended, regardless of lane
-func (rb *Roundabout) ExWriteAll(fn func(uint16, uint16) error) error {
+func (rb *Roundabout) LockRing(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, ExWriteAll)
+		rb_cell, ok := rb.push(0, LockRing)
 		if !ok {
 			continue
 		}
@@ -496,10 +505,10 @@ func (rb *Roundabout) ExWriteAll(fn func(uint16, uint16) error) error {
 	return nil
 }
 
-// run the callback once all write callbacks have ended, regardless of lane
-func (rb *Roundabout) ShWriteAll(fn func(uint16, uint16) error) error {
+// run the callback once all Locked, Order callbacks have ended, regardless of lane
+func (rb *Roundabout) OrderRing(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, ShWriteAll)
+		rb_cell, ok := rb.push(0, OrderRing)
 		if !ok {
 			continue
 		}
@@ -513,10 +522,10 @@ func (rb *Roundabout) ShWriteAll(fn func(uint16, uint16) error) error {
 	return nil
 }
 
-// run the callback once all exclusive write callbacks are over, whatever lane
-func (rb *Roundabout) ReadAll(fn func(uint16, uint16) error) error {
+// run the callback once all Locked callbacks are over, whatever lane
+func (rb *Roundabout) ShareRing(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, ReadAll)
+		rb_cell, ok := rb.push(0, ShareRing)
 		if !ok {
 			continue
 		}
@@ -531,9 +540,9 @@ func (rb *Roundabout) ReadAll(fn func(uint16, uint16) error) error {
 }
 
 // run the callback once all other callbacks with the same lane are over
-func (rb *Roundabout) ExWriteLane(lane uint32, fn func(uint16, uint16) error) error {
+func (rb *Roundabout) LockLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, ExWriteLane)
+		rb_cell, ok := rb.push(lane, LockLane)
 		// XXX could count the spins here
 		// and park the thread
 
@@ -550,10 +559,10 @@ func (rb *Roundabout) ExWriteLane(lane uint32, fn func(uint16, uint16) error) er
 	return nil
 }
 
-// run the callback when no other write callbacks with the same lane are active
-func (rb *Roundabout) ShWriteLane(lane uint32, fn func(uint16, uint16) error) error {
+// run the callback when no other Locked, Order callbacks with the same lane are active
+func (rb *Roundabout) OrderLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, ShWriteLane)
+		rb_cell, ok := rb.push(lane, OrderLane)
 		// XXX could count the spins here
 		// and park the thread
 
@@ -570,10 +579,10 @@ func (rb *Roundabout) ShWriteLane(lane uint32, fn func(uint16, uint16) error) er
 	return nil
 }
 
-// run the callback when no exclusive write with the same lane are active
-func (rb *Roundabout) ReadLane(lane uint32, fn func(uint16, uint16) error) error {
+// run the callback when no Locked with the same lane are active
+func (rb *Roundabout) ShareLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, ReadLane)
+		rb_cell, ok := rb.push(lane, ShareLane)
 		if !ok {
 			continue
 		}

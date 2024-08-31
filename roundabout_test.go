@@ -10,8 +10,8 @@ import (
 
 func TestRoundabout(t *testing.T) {
 	b2 := Roundabout{}
-	start, _ := b2.push(1001, ExWriteLane)
-	ended, _ := b2.push(1001, ExWriteLane)
+	start, _ := b2.push(1001, LockLane)
+	ended, _ := b2.push(1001, LockLane)
 
 	b := Roundabout{}
 	t.Log(b.String())
@@ -21,16 +21,16 @@ func TestRoundabout(t *testing.T) {
 		b.Phase(123, func(epoch uint16, flags uint16) error {
 			t.Log("in phase start", b.String())
 			b2.pop(start)
-			b.push(1111, ExWriteLane)
+			b.push(1111, LockLane)
 			return nil
 		}, func(start, end uint16) error {
 			t.Log("from", start, "to", end)
 			return nil
 		})
 	}()
-	r1, _ := b.push(1, ExWriteLane)
-	r2, _ := b.push(1, ExWriteLane)
-	r3, _ := b.push(1, ExWriteLane)
+	r1, _ := b.push(1, LockLane)
+	r2, _ := b.push(1, LockLane)
+	r3, _ := b.push(1, LockLane)
 	t.Log(b.String())
 
 	var done bool
@@ -58,15 +58,15 @@ func TestRoundabout(t *testing.T) {
 
 func TestWriteLock(t *testing.T) {
 	b := Roundabout{}
-	r1, _ := b.push(1, ExWriteLane)
-	rX, _ := b.push(10, ExWriteLane)
-	rY, _ := b.push(10, ExWriteLane)
+	r1, _ := b.push(1, LockLane)
+	rX, _ := b.push(10, LockLane)
+	rY, _ := b.push(10, LockLane)
 	var r3 rb_cell
 
 	var done bool
 	go func() {
-		b.ExWriteLane(1, func(uint16, uint16) error {
-			r3, _ = b.push(1, ExWriteLane)
+		b.LockLane(1, func(uint16, uint16) error {
+			r3, _ = b.push(1, LockLane)
 			b.pop(rX)
 			done = true
 			return nil
@@ -92,16 +92,16 @@ func TestWriteLock(t *testing.T) {
 func TestSpinLockAll(t *testing.T) {
 	rb := Roundabout{}
 
-	rb1, _ := rb.push(1, ExWriteLane)
-	rb2, _ := rb.push(1, ExWriteLane)
+	rb1, _ := rb.push(1, LockLane)
+	rb2, _ := rb.push(1, LockLane)
 
 	b := Roundabout{}
-	r1, _ := b.push(1, ExWriteLane)
-	r2, _ := b.push(2, ExWriteLane)
+	r1, _ := b.push(1, LockLane)
+	r2, _ := b.push(2, LockLane)
 
 	var done bool
 	go func() {
-		b.ExWriteLane(1, func(uint16, uint16) error {
+		b.LockLane(1, func(uint16, uint16) error {
 			t.Log("in lock")
 			done = true
 			rb.pop(rb1)

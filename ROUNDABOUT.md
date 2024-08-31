@@ -14,11 +14,10 @@ The implementation here is slightly different:
 
 - There is a 32 element ringbuffer, and an int64 header including an epoch and a bitfield
 - Threads announce work with a (kind, lane) pair
-- Kind is Read/Write, on a paritcular lane, or all lanes
-- Writes wait for Reads to complete, Reads wait for Writes to complete
-- Two Writes on different lanes will not wait for each other
-- Reads never wait for each other
-- Writes come in two kinds, Shared and Exclusive
+- Kind is Share/Order/Lock, on a paritcular lane, or all lanes
+- Share is unordered, Order can overlap with Share, but Lock precludes all
+- Two Share/Order/Lock on different lanes will not wait for each other
+- Share never wait for each other, Order, Lock do
 
 A roundabout can be used for big locks, fine grained locks, reader-writer locks, as well as coordinating things like resizing or snapshots.  The name stems from the traffic intersection. A thread yields to other threads already on the roundabout, chooses a lane to occupy, and makes progress if no-one's ahead of them, before exiting. 
 
@@ -27,7 +26,7 @@ Here's what it looks like:
 ```
 r := Roundabout{}
 
-r.ExWriteAll(func(epoch uint16, flags uint16) error{
+r.LockRing(func(epoch uint16, flags uint16) error{
     // will only run after all older threads exit
     // will stall all newer threads from running
 
@@ -36,14 +35,14 @@ r.ExWriteAll(func(epoch uint16, flags uint16) error{
 
 
 var lane uint32 = 12234
-r.ExWriteLane(lane, func(epoch uint16, flags uint16) error {
+r.LockLane(lane, func(epoch uint16, flags uint16) error {
     // this callback will never be invoked while other callbacks
     // are running with the same lane
 
     ...
 })
-r.ReadLane(lane, func(epoch uint16, flags uint16) error {
-    // wait for ExWriters, but don't wait for Reads
+r.ShareLane(lane, func(epoch uint16, flags uint16) error {
+    // wait for Lockrs, but don't wait for Reads
     ...
 })
 
@@ -73,19 +72,19 @@ a `lane`, and a `kind` to let other threads reading the log if there's a conflic
 
 This allows a roundabout to offer something a little bit like locking, in several different flavours:
 
-- Like a single, big lock, `r.ExWriteAll(...)`
+- Like a single, big lock, `r.LockRing(...)`
 	- The mutator threads spin until all predecessors are complete
 	- Succesor threads spin when encountering a big lock in the log
     - Unlike a normal lock, threads establish priority in who gets to go next
 
-- Like a reader, writer lock, `r.ReadAll(...)`
-    - If a SpinRead encounters another SpinRead, it continues on
-	- Only writers force mutual exclusion
+- Like a reader, writer lock, `r.ShareRing(...)`
+    - If a ShareRing encounters another ShareRing/ShareLane, it continues on
+	- Only Locks force mutual exclusion of Share, Order's are unaffected
 
-- Like a fine grained lock, `r.ExWriteLane(lane, ...)`
+- Like a fine grained lock, `r.LockLane(lane, ...)`
 	- Each thread inserts a 32bit lane, and spins if there's a matching lane
     - If they encounter a big lock, they wait for it too
-    - There's also `r.ReadLane(lane, ...)` which only conflict with writes of the same key
+    - There's also `r.ShareLane(lane, ...)` which only conflict with writes of the same key
 
 - Like Read-Copy-Update, `r.Fence()`, `r.Phase()`
     - A fence can be used to notify all future writers an operation is in progress, via a uint16 of flags
@@ -114,7 +113,7 @@ It's really just a fancy ring buffer.
 	- The flags are passed on to mutator threads allocating
 - There's items of (epoch, kind, lane32)
 	- The epoch lets us know if an item comes before or after us
-	- Kind indicates what sort of entry (ReadLane, ExWriteLane, etc)
+	- Kind indicates what sort of entry (ShareLane, LockLane, etc)
 	- Lane32 lets us find conflicting items
 - There's only 32 slots in the ring buffer
     - That's ok though, 32 is a pretty big number in terms of active CPUs
@@ -134,6 +133,8 @@ with a bitfield free-list:
 	- Replace item with (epoch+width, free_kind, 0)
 	- This lets later writers skip the entry, or spin until it's allocated
 	- CAS in a new header with the bitfield updated
+
+## Magic Roundabout 
 
 It's possible to have a roundabout of more than 32 entries, You could chain
 them up in a linked list, you could have a larger bitfield and use the epoch
@@ -158,7 +159,20 @@ to scan
 to remove
 - we update our bitmap, and if it's now all 0's for this bucket, we reset the bitmap, 
 - and then mark it as free in the header
-- this admits a race of looking at the bucket bitmap before the header bits are cleared
+
+to ensure there's no race between updating the header and a mark being in the bitmap for an active process,
+we need to be careful, if we reset the bucket bitmap to 'in use' after 'free' before we update the header, another process might accidentally see it as 'in-use'. if we mark the bucket as clear in the header first, another process might see it as 'free' before 'in-use' and skip over slots. this way lies false positvies or false negatives.
+
+instead, we place the burden on the allocating thread, not the deallocating thread
+- when a new item is the first item in a bucket, we check that it is clear in the header, 
+- then we check the bucket bitmap to say "in use" for all, then we can allocate
+- any new process that arrives will see the header as being clear, and skip it, or it will see a fully in use bucket, and skip over the later elements as not being < epoch
+- if two processes race, it's stil safe. one will flip the bits first, and the other might allocate first, but neither is locked.
+
+
+instead, we put the burden on the allocator
+- we mark the bucket ahead of time as being all active, but it will be ignored as the bucket is not in use
+- 
 
 
 

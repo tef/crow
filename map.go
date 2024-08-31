@@ -30,7 +30,7 @@ func (m *LockedMap) Load(key any) (value any, ok bool) {
 		return nil, false
 	}
 
-	m.rb.ReadAll(func(epoch uint16, flags uint16) error {
+	m.rb.ShareRing(func(epoch uint16, flags uint16) error {
 		value, ok = m.inner[key]
 		return nil
 	})
@@ -38,7 +38,7 @@ func (m *LockedMap) Load(key any) (value any, ok bool) {
 }
 
 func (m *LockedMap) Store(key, value any) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.inner = make(map[any]any, 8)
 		}
@@ -49,7 +49,7 @@ func (m *LockedMap) Store(key, value any) {
 }
 
 func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.inner = make(map[any]any, 8)
 		}
@@ -64,7 +64,7 @@ func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
 }
 
 func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -80,7 +80,7 @@ func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
 }
 
 func (m *LockedMap) CompareAndSwap(key, old, new any) (swapped bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -96,7 +96,7 @@ func (m *LockedMap) CompareAndSwap(key, old, new any) (swapped bool) {
 }
 
 func (m *LockedMap) Delete(key any) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -106,7 +106,7 @@ func (m *LockedMap) Delete(key any) {
 }
 
 func (m *LockedMap) LoadAndDelete(key any) (value any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -119,7 +119,7 @@ func (m *LockedMap) LoadAndDelete(key any) (value any, loaded bool) {
 }
 
 func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -133,7 +133,7 @@ func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 }
 
 func (m *LockedMap) Range(f func(key, value any) bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.OrderRing(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
 		}
@@ -148,7 +148,7 @@ func (m *LockedMap) Range(f func(key, value any) bool) {
 }
 
 func (m *LockedMap) Clear() {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		m.inner = make(map[any]any, 8)
 		return nil
 	})
@@ -166,7 +166,7 @@ func (m *BoxedMap) Load(key any) (value any, ok bool) {
 		return nil, false
 	}
 
-	m.rb.ReadAll(func(epoch uint16, flags uint16) error {
+	m.rb.ShareRing(func(epoch uint16, flags uint16) error {
 		v, loaded := m.inner[key]
 		if loaded && v != nil {
 			value = v.Load()
@@ -182,7 +182,7 @@ func (m *BoxedMap) init() {
 }
 
 func (m *BoxedMap) Store(key, value any) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.init()
 		}
@@ -195,7 +195,7 @@ func (m *BoxedMap) Store(key, value any) {
 }
 
 func (m *BoxedMap) Swap(key, value any) (previous any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.init()
 		}
@@ -217,7 +217,7 @@ func (m *BoxedMap) Swap(key, value any) (previous any, loaded bool) {
 }
 
 func (m *BoxedMap) CompareAndDelete(key, old any) (deleted bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -236,7 +236,7 @@ func (m *BoxedMap) CompareAndDelete(key, old any) (deleted bool) {
 }
 
 func (m *BoxedMap) CompareAndSwap(key, old any, newv any) (swapped bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.OrderRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -255,7 +255,9 @@ func (m *BoxedMap) CompareAndSwap(key, old any, newv any) (swapped bool) {
 }
 
 func (m *BoxedMap) Delete(key any) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	// if delete put tombstone in atomic value, this
+	// could be shared write
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -265,7 +267,7 @@ func (m *BoxedMap) Delete(key any) {
 }
 
 func (m *BoxedMap) LoadAndDelete(key any) (value any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -283,7 +285,7 @@ func (m *BoxedMap) LoadAndDelete(key any) (value any, loaded bool) {
 }
 
 func (m *BoxedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -305,7 +307,10 @@ func (m *BoxedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 }
 
 func (m *BoxedMap) Range(f func(key, value any) bool) {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	// inserts/deletes or anything triggering resize should be fine
+	// and other reads should be fine, and the values
+	// inside are atomic
+	m.rb.ShareRing(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
 		}
@@ -324,7 +329,7 @@ func (m *BoxedMap) Range(f func(key, value any) bool) {
 }
 
 func (m *BoxedMap) Clear() {
-	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		m.init()
 		return nil
 	})
@@ -345,18 +350,18 @@ type ReadWriteMap struct {
 /*
 	read
 		load from read, check for dead or nil entry
-		if miss, ReadAll() on write
+		if miss, ShareRing() on write
 	insert
 		load from read, check for expunged record, if so,
 		insert it into write, and unexpunge it
 		else create new and insert into write
 	delete
 		if in read, atomically update value
-		if not in read, WriteAll to check write
+		if not in read, WriteRing to check write
 			and delete value with nil - can't delete unless we're sure it's not in read
 	update
 		if in read, atomically update value
-		if in write, WriteAll ..
+		if in write, WriteRing ..
 
 	on several misses
 		move write into read, maybe deleting old values
