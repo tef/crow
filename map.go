@@ -18,6 +18,8 @@ type ConcurrentMap interface {
 	Swap(key, value any) (previous any, loaded bool)
 }
 
+// A Big Locked Struct
+
 type LockedMap struct {
 	rb    Roundabout
 	inner map[any]any
@@ -50,8 +52,10 @@ func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
 	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.inner = make(map[any]any, 8)
-		} else {
-			previous, loaded = m.inner[key]
+		}
+		previous, loaded = m.inner[key]
+		if !loaded {
+			previous = value
 		}
 		m.inner[key] = value
 		return nil
@@ -146,6 +150,182 @@ func (m *LockedMap) Range(f func(key, value any) bool) {
 func (m *LockedMap) Clear() {
 	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		m.inner = make(map[any]any, 8)
+		return nil
+	})
+}
+
+// Locked with Update
+
+type BoxedMap struct {
+	rb    Roundabout
+	inner map[any]*atomic.Value
+}
+
+func (m *BoxedMap) Load(key any) (value any, ok bool) {
+	if m == nil {
+		return nil, false
+	}
+
+	m.rb.ReadAll(func(epoch uint16, flags uint16) error {
+		v, loaded := m.inner[key]
+		if loaded && v != nil {
+			value = v.Load()
+			ok = loaded
+		}
+		return nil
+	})
+	return
+}
+
+func (m *BoxedMap) init() {
+	m.inner = make(map[any]*atomic.Value, 8)
+}
+
+func (m *BoxedMap) Store(key, value any) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			m.init()
+		}
+		v := new(atomic.Value)
+		v.Store(value)
+		m.inner[key] = v
+		return nil
+	})
+
+}
+
+func (m *BoxedMap) Swap(key, value any) (previous any, loaded bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			m.init()
+		}
+
+		v, loaded := m.inner[key]
+		if loaded && v != nil {
+			previous = v.Load()
+			v.Store(value)
+		} else {
+			v := new(atomic.Value)
+			v.Store(value)
+			m.inner[key] = v
+			previous = value
+		}
+
+		return nil
+	})
+	return
+}
+
+func (m *BoxedMap) CompareAndDelete(key, old any) (deleted bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			return nil
+		}
+		v, ok := m.inner[key]
+		if ok && v == nil {
+			value := v.Load()
+			if value == old {
+				delete(m.inner, key)
+				deleted = true
+			}
+		}
+
+		return nil
+	})
+	return
+}
+
+func (m *BoxedMap) CompareAndSwap(key, old any, newv any) (swapped bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			return nil
+		}
+		v, ok := m.inner[key]
+		if ok && v == nil {
+			value := v.Load()
+			if value == old {
+				m.inner[key].Store(newv)
+				swapped = true
+			}
+		}
+
+		return nil
+	})
+	return
+}
+
+func (m *BoxedMap) Delete(key any) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			return nil
+		}
+		delete(m.inner, key)
+		return nil
+	})
+}
+
+func (m *BoxedMap) LoadAndDelete(key any) (value any, loaded bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			return nil
+		}
+		v, ok := m.inner[key]
+		if ok && v != nil {
+			value = v.Load()
+			loaded = ok
+		}
+
+		delete(m.inner, key)
+		return nil
+	})
+	return
+
+}
+
+func (m *BoxedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if m.inner == nil {
+			return nil
+		}
+		v, ok := m.inner[key]
+		if ok {
+			loaded = false
+			actual = value
+
+			m.inner[key].Store(value)
+		} else {
+			loaded = true
+			if v != nil {
+				actual = v.Load()
+			}
+		}
+		return nil
+	})
+	return
+}
+
+func (m *BoxedMap) Range(f func(key, value any) bool) {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		if len(m.inner) == 0 {
+			return nil
+		}
+		for k, v := range m.inner {
+			var a any
+			if v != nil {
+				a = v.Load()
+			}
+			if !f(k, a) {
+				break
+			}
+		}
+		return nil
+	})
+
+}
+
+func (m *BoxedMap) Clear() {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
+		m.init()
 		return nil
 	})
 }

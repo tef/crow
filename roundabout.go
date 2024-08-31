@@ -83,20 +83,10 @@ to SpinLock etc but our hands are tied in go, alas.
 
 */
 
-// roundabout cell kind
+// roundabout cell kind, could be reorged to allow easy bitfield testing
 const (
 	ZeroCell    uint16 = iota // unitialised memory, all 0
 	PendingCell               // epoch set, kind pending
-
-	/*
-		A ReadLane/ReadAll indicates an active reader
-		A ExWrite/ShWrite indicates an active writer
-
-		A shared writer never blocks reads, but will block
-		overlapping writers. An exclusive writer blocks
-		all other types
-
-	*/
 
 	ReadLane // Blocks on Exclusive Writes in Lane, ignores SharedWrites, Reads
 	ReadAll  // Blocks on Any Exclusive Writes, ignores SharedWrites, Reads
@@ -209,6 +199,9 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 
 	// if we're within width bits, epoch could have
 	// active predecessors
+
+	// XXX could create a 1111111 bit, << diff, then rot it by epoch
+	// and just AND it with header
 
 	diff := h.epoch - epoch
 
@@ -486,7 +479,58 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 
 }
 
-// run the callback when no other callbacks with the same lane are active
+// run the callback once all other callbacks have ended, regardless of lane
+func (rb *Roundabout) ExWriteAll(fn func(uint16, uint16) error) error {
+	for true {
+		rb_cell, ok := rb.push(0, ExWriteAll)
+		if !ok {
+			continue
+		}
+
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
+		// maybe think about passing in epoch and flags
+		return fn(rb_cell.epoch, rb_cell.flags)
+	}
+	// huh
+	return nil
+}
+
+// run the callback once all write callbacks have ended, regardless of lane
+func (rb *Roundabout) ShWriteAll(fn func(uint16, uint16) error) error {
+	for true {
+		rb_cell, ok := rb.push(0, ShWriteAll)
+		if !ok {
+			continue
+		}
+
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
+		// maybe think about passing in epoch and flags
+		return fn(rb_cell.epoch, rb_cell.flags)
+	}
+	// huh
+	return nil
+}
+
+// run the callback once all exclusive write callbacks are over, whatever lane
+func (rb *Roundabout) ReadAll(fn func(uint16, uint16) error) error {
+	for true {
+		rb_cell, ok := rb.push(0, ReadAll)
+		if !ok {
+			continue
+		}
+
+		rb.wait(rb_cell)
+		defer rb.pop(rb_cell)
+
+		return fn(rb_cell.epoch, rb_cell.flags)
+	}
+	// huh
+	return nil
+}
+
+// run the callback once all other callbacks with the same lane are over
 func (rb *Roundabout) ExWriteLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
 		rb_cell, ok := rb.push(lane, ExWriteLane)
@@ -506,46 +550,30 @@ func (rb *Roundabout) ExWriteLane(lane uint32, fn func(uint16, uint16) error) er
 	return nil
 }
 
-// run the callback once all other callbacks have ended, regardless of lane
-func (rb *Roundabout) ExWriteAll(fn func(uint16, uint16) error) error {
+// run the callback when no other write callbacks with the same lane are active
+func (rb *Roundabout) ShWriteLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, ExWriteAll)
+		rb_cell, ok := rb.push(lane, ShWriteLane)
+		// XXX could count the spins here
+		// and park the thread
+
 		if !ok {
 			continue
 		}
 
 		rb.wait(rb_cell)
 		defer rb.pop(rb_cell)
-		// maybe think about passing in epoch and flags
+
 		return fn(rb_cell.epoch, rb_cell.flags)
 	}
 	// huh
 	return nil
 }
 
-// run the callback when no other callbacks with the same lane are active
-// except other readers
+// run the callback when no exclusive write with the same lane are active
 func (rb *Roundabout) ReadLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
 		rb_cell, ok := rb.push(lane, ReadLane)
-		if !ok {
-			continue
-		}
-
-		rb.wait(rb_cell)
-		defer rb.pop(rb_cell)
-
-		return fn(rb_cell.epoch, rb_cell.flags)
-	}
-	// huh
-	return nil
-}
-
-// run the callback when no other callbacks are running, whatever lane
-// except other readers
-func (rb *Roundabout) ReadAll(fn func(uint16, uint16) error) error {
-	for true {
-		rb_cell, ok := rb.push(0, ReadAll)
 		if !ok {
 			continue
 		}
