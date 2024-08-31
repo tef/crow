@@ -10,8 +10,8 @@ import (
 
 func TestRoundabout(t *testing.T) {
 	b2 := Roundabout{}
-	start, _ := b2.push(1001, WriteLane)
-	ended, _ := b2.push(1001, WriteLane)
+	start, _ := b2.push(1001, ExWriteLane)
+	ended, _ := b2.push(1001, ExWriteLane)
 
 	b := Roundabout{}
 	t.Log(b.String())
@@ -21,16 +21,16 @@ func TestRoundabout(t *testing.T) {
 		b.Phase(123, func(epoch uint16, flags uint16) error {
 			t.Log("in phase start", b.String())
 			b2.pop(start)
-			b.push(1111, WriteLane)
+			b.push(1111, ExWriteLane)
 			return nil
 		}, func(start, end uint16) error {
 			t.Log("from", start, "to", end)
 			return nil
 		})
 	}()
-	r1, _ := b.push(1, WriteLane)
-	r2, _ := b.push(1, WriteLane)
-	r3, _ := b.push(1, WriteLane)
+	r1, _ := b.push(1, ExWriteLane)
+	r2, _ := b.push(1, ExWriteLane)
+	r3, _ := b.push(1, ExWriteLane)
 	t.Log(b.String())
 
 	var done bool
@@ -56,17 +56,17 @@ func TestRoundabout(t *testing.T) {
 	t.Log(b.String())
 }
 
-func TestSpinLock(t *testing.T) {
+func TestWriteLock(t *testing.T) {
 	b := Roundabout{}
-	r1, _ := b.push(1, WriteLane)
-	rX, _ := b.push(10, WriteLane)
-	rY, _ := b.push(10, WriteLane)
+	r1, _ := b.push(1, ExWriteLane)
+	rX, _ := b.push(10, ExWriteLane)
+	rY, _ := b.push(10, ExWriteLane)
 	var r3 rb_cell
 
 	var done bool
 	go func() {
-		b.SpinLock(1, func(uint16, uint16) error {
-			r3, _ = b.push(1, WriteLane)
+		b.ExWriteLane(1, func(uint16, uint16) error {
+			r3, _ = b.push(1, ExWriteLane)
 			b.pop(rX)
 			done = true
 			return nil
@@ -92,16 +92,16 @@ func TestSpinLock(t *testing.T) {
 func TestSpinLockAll(t *testing.T) {
 	rb := Roundabout{}
 
-	rb1, _ := rb.push(1, WriteLane)
-	rb2, _ := rb.push(1, WriteLane)
+	rb1, _ := rb.push(1, ExWriteLane)
+	rb2, _ := rb.push(1, ExWriteLane)
 
 	b := Roundabout{}
-	r1, _ := b.push(1, WriteLane)
-	r2, _ := b.push(2, WriteLane)
+	r1, _ := b.push(1, ExWriteLane)
+	r2, _ := b.push(2, ExWriteLane)
 
 	var done bool
 	go func() {
-		b.SpinLock(1, func(uint16, uint16) error {
+		b.ExWriteLane(1, func(uint16, uint16) error {
 			t.Log("in lock")
 			done = true
 			rb.pop(rb1)

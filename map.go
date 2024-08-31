@@ -28,7 +28,7 @@ func (m *LockedMap) Load(key any) (value any, ok bool) {
 		return nil, false
 	}
 
-	m.rb.SpinReadAll(func(epoch uint16, flags uint16) error {
+	m.rb.ReadAll(func(epoch uint16, flags uint16) error {
 		value, ok = m.inner[key]
 		return nil
 	})
@@ -36,7 +36,7 @@ func (m *LockedMap) Load(key any) (value any, ok bool) {
 }
 
 func (m *LockedMap) Store(key, value any) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.inner = make(map[any]any, 8)
 		}
@@ -47,7 +47,7 @@ func (m *LockedMap) Store(key, value any) {
 }
 
 func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.inner = make(map[any]any, 8)
 		} else {
@@ -60,7 +60,7 @@ func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
 }
 
 func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -76,7 +76,7 @@ func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
 }
 
 func (m *LockedMap) CompareAndSwap(key, old, new any) (swapped bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -92,7 +92,7 @@ func (m *LockedMap) CompareAndSwap(key, old, new any) (swapped bool) {
 }
 
 func (m *LockedMap) Delete(key any) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -102,7 +102,7 @@ func (m *LockedMap) Delete(key any) {
 }
 
 func (m *LockedMap) LoadAndDelete(key any) (value any, loaded bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -115,7 +115,7 @@ func (m *LockedMap) LoadAndDelete(key any) (value any, loaded bool) {
 }
 
 func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -129,7 +129,7 @@ func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 }
 
 func (m *LockedMap) Range(f func(key, value any) bool) {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
 		}
@@ -144,7 +144,7 @@ func (m *LockedMap) Range(f func(key, value any) bool) {
 }
 
 func (m *LockedMap) Clear() {
-	m.rb.SpinLockAll(func(epoch uint16, flags uint16) error {
+	m.rb.ExWriteAll(func(epoch uint16, flags uint16) error {
 		m.inner = make(map[any]any, 8)
 		return nil
 	})
@@ -165,18 +165,18 @@ type ReadWriteMap struct {
 /*
 	read
 		load from read, check for dead or nil entry
-		if miss, SpinReadAll() on write
+		if miss, ReadAll() on write
 	insert
 		load from read, check for expunged record, if so,
 		insert it into write, and unexpunge it
 		else create new and insert into write
 	delete
 		if in read, atomically update value
-		if not in read, SpinWriteAll to check write
+		if not in read, WriteAll to check write
 			and delete value with nil - can't delete unless we're sure it's not in read
 	update
 		if in read, atomically update value
-		if in write, SpinWriteAll ..
+		if in write, WriteAll ..
 
 	on several misses
 		move write into read, maybe deleting old values

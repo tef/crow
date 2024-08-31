@@ -88,32 +88,32 @@ const (
 	ZeroCell    uint16 = iota // unitialised memory, all 0
 	PendingCell               // epoch set, kind pending
 
-	ReadLane // Blocks Writes in Lane
-	ReadAll  // Blocks Writes
-
-	AtomicLane // Doesn't block reads, blocks any Atomic or Write in lane
-	AtomicAll  // Doesn't block reads, blocks any Atomic or Write
-
-	WriteLane // Blocks all reads, writes in lane
-	WriteAll  // Blocks all reads, writes
-
 	/*
-		for example, on a hash table of string, atomic.Value
-		readall would allow concurrent reads, atomicall would allow
-		for atomic updates of values, but not create/delete, and writeall
-		would be needed for create/delete
+		A ReadLane/ReadAll indicates an active reader
+		A ExWrite/ShWrite indicates an active writer
+
+		A shared writer never blocks reads, but will block
+		overlapping writers. An exclusive writer blocks
+		all other types
+
 	*/
 
-	// We could also have AbortCell, AbortAllCell
-	// to force later writers to abandon work
+	ReadLane // Blocks on Exclusive Writes in Lane, ignores SharedWrites, Reads
+	ReadAll  // Blocks on Any Exclusive Writes, ignores SharedWrites, Reads
 
-	// We could also have SpinPrefix or SpinLe / SpinGe
-	// to vary key matching rules, but it doesn't really
-	// handle priority: new entries do not block old ones
+	ShWriteLane // Blocks on any Write in Lane, ignores Reads
+	ShWriteAll  // Blocks on any Write, ignores Reads
 
-	// a <cell type><key type> encoding might go a long way
-	// but there doesn't seem to be any genuine use cases
-	// outside of "read/write" and "unallocated" / "uninitialised"
+	ExWriteLane // Blocks on all predecessors in lane
+	ExWriteAll  // Blocks on all predecessors
+
+	/*
+		There is room for other behaviours, but a user
+		can override lane matching behaviour with a function
+
+		In theory, we could make an entry that tells future
+		workers to abort, but flags already handle that case
+	*/
 )
 
 // the header of the ring buffer
@@ -309,10 +309,10 @@ func (rb *Roundabout) wait(r rb_cell) {
 					continue
 				}
 
-				if r.kind == WriteAll || item.kind == WriteAll {
+				if r.kind == ExWriteAll || item.kind == ExWriteAll {
 					// we wait for all predecessors
 					continue
-				} else if r.kind == AtomicAll {
+				} else if r.kind == ShWriteAll {
 					// atomics not blocked by reads
 					if item.kind == ReadLane || item.kind == ReadAll {
 						break
@@ -323,41 +323,41 @@ func (rb *Roundabout) wait(r rb_cell) {
 
 				} else if r.kind == ReadAll {
 					// we block when we see a write, but not atomics
-					if item.kind == WriteLane || item.kind == WriteAll {
+					if item.kind == ExWriteLane || item.kind == ExWriteAll {
 						continue
 					}
 					break
-				} else if r.kind == WriteLane {
+				} else if r.kind == ExWriteLane {
 					// block on all wide actions
-					if item.kind == WriteAll || item.kind == AtomicAll || item.kind == ReadAll {
+					if item.kind == ExWriteAll || item.kind == ShWriteAll || item.kind == ReadAll {
 						continue
 					}
-					// check lane below for WriteLane, AtomicLane, ReadLane
+					// check lane below for ExWriteLane, ShWriteLane, ReadLane
 
-				} else if r.kind == AtomicLane {
+				} else if r.kind == ShWriteLane {
 					// block on all wide actions, except reads
-					if item.kind == WriteAll || item.kind == AtomicAll {
+					if item.kind == ExWriteAll || item.kind == ShWriteAll {
 						continue
 					}
 					// ignore reads
 					if item.kind == ReadLane || item.kind == ReadAll {
 						break
 					}
-					// check lane for WriteLane, AtomicLane
+					// check lane for ExWriteLane, ShWriteLane
 
 				} else if r.kind == ReadLane {
 					// blocked by any write
-					if item.kind == WriteAll {
+					if item.kind == ExWriteAll {
 						continue
 					}
 					// ignores atomics, reads
-					if item.kind == AtomicLane || item.kind == AtomicAll {
+					if item.kind == ShWriteLane || item.kind == ShWriteAll {
 						break
 					}
 					if item.kind == ReadLane || item.kind == ReadAll {
 						break
 					}
-					// check lane for WriteLane below
+					// check lane for ExWriteLane below
 				}
 				// if we're an write lane, we check write, atomic, read lane here
 				// if we're an atomic lane, we check write, atomic lane here
@@ -487,9 +487,9 @@ func (rb *Roundabout) clearFence(s rb_fence) uint16 {
 }
 
 // run the callback when no other callbacks with the same lane are active
-func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error {
+func (rb *Roundabout) ExWriteLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(lane, WriteLane)
+		rb_cell, ok := rb.push(lane, ExWriteLane)
 		// XXX could count the spins here
 		// and park the thread
 
@@ -507,9 +507,9 @@ func (rb *Roundabout) SpinLock(lane uint32, fn func(uint16, uint16) error) error
 }
 
 // run the callback once all other callbacks have ended, regardless of lane
-func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
+func (rb *Roundabout) ExWriteAll(fn func(uint16, uint16) error) error {
 	for true {
-		rb_cell, ok := rb.push(0, WriteAll)
+		rb_cell, ok := rb.push(0, ExWriteAll)
 		if !ok {
 			continue
 		}
@@ -525,7 +525,7 @@ func (rb *Roundabout) SpinLockAll(fn func(uint16, uint16) error) error {
 
 // run the callback when no other callbacks with the same lane are active
 // except other readers
-func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error {
+func (rb *Roundabout) ReadLane(lane uint32, fn func(uint16, uint16) error) error {
 	for true {
 		rb_cell, ok := rb.push(lane, ReadLane)
 		if !ok {
@@ -543,7 +543,7 @@ func (rb *Roundabout) SpinRead(lane uint32, fn func(uint16, uint16) error) error
 
 // run the callback when no other callbacks are running, whatever lane
 // except other readers
-func (rb *Roundabout) SpinReadAll(fn func(uint16, uint16) error) error {
+func (rb *Roundabout) ReadAll(fn func(uint16, uint16) error) error {
 	for true {
 		rb_cell, ok := rb.push(0, ReadAll)
 		if !ok {
