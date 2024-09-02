@@ -153,17 +153,25 @@ func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 }
 
 func (m *LockedMap) Range(f func(key, value any) bool) {
+	// range allows map operations inside callback, so
+	// we make a copy, as go does not have iterators
+	var copy map[any]any
 	m.rb.OrderRing(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
 		}
 		for k, v := range m.inner {
-			if !f(k, v) {
-				break
+			if v != nil {
+				copy[k] = v
 			}
 		}
 		return nil
 	})
+	for k, v := range copy {
+		if !f(k, v) {
+			break
+		}
+	}
 
 }
 
@@ -180,12 +188,8 @@ type BoxedEntry struct {
 	inner atomic.Value
 }
 
-func (b *BoxedEntry) Load() (any, bool) {
-	v := b.inner.Load()
-	if v == nil {
-		return nil, false
-	}
-	return v, true
+func (b *BoxedEntry) Load() any {
+	return b.inner.Load()
 }
 
 func (b *BoxedEntry) Store(o any) {
@@ -202,7 +206,6 @@ func (b *BoxedEntry) CompareAndSwap(old any, new any) bool {
 func (b *BoxedEntry) Delete() {
 	b.inner.Store(nil)
 }
-
 
 type BoxedMap struct {
 	rb    Roundabout
@@ -229,7 +232,7 @@ func (m *BoxedMap) Load(key any) (value any, ok bool) {
 }
 
 func (m *BoxedMap) init() {
-	m.inner = make(map[any]*atomic.Value, 8)
+	m.inner = make(map[any]*BoxedEntry, 8)
 }
 
 func (m *BoxedMap) Store(key, value any) {
@@ -356,7 +359,7 @@ func (m *BoxedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 			actual = v.Load()
 			loaded = actual != nil
 		}
-			
+
 		if !loaded {
 			actual = value
 			// this could be two operations
@@ -374,7 +377,7 @@ func (m *BoxedMap) Range(f func(key, value any) bool) {
 
 	// nb go map allows map operations inside this,
 	// so we should make a copy
-	var copy map[any]*BoxedEntry
+	var copy map[any]any
 	m.rb.ShareRing(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
@@ -391,7 +394,7 @@ func (m *BoxedMap) Range(f func(key, value any) bool) {
 		return nil
 	})
 	for k, v := range copy {
-		if !f(k, a) {
+		if !f(k, v) {
 			break
 		}
 	}
@@ -428,7 +431,7 @@ type ReadWriteMap struct {
 	insert
 		if write empty, create dict
 		insert into dict, copy to write, read
-		else lookup, then add to write and update changes 
+		else lookup, then add to write and update changes
 	read
 		load from read, check for dead or nil entry
 		if miss, ShareRing() on write

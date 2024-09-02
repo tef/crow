@@ -89,13 +89,13 @@ const (
 	PendingCell               // epoch set, kind pending
 
 	ShareLane // Blocks on Locks, ignores Order and Share in lane
-	ShareRing  // Blocks on Locks, ignores Order and Share in ring
+	ShareRing // Blocks on Locks, ignores Order and Share in ring
 
 	OrderLane // Blocks on any Lock, Order in lane, ignores Share
-	OrderRing  // Blocks on any Lock, Order in ring, ignores Share
+	OrderRing // Blocks on any Lock, Order in ring, ignores Share
 
 	LockLane // Blocks on any predecessors in lane
-	LockRing  // Blocks on all predecessors in ring
+	LockRing // Blocks on all predecessors in ring
 
 	/*
 		There is room for other behaviours, but a user
@@ -175,8 +175,8 @@ type Roundabout struct {
 }
 
 // before you ask, yes, 32 isn't a lot of elements, but it is currently a lot of cpus
-// we could build a larger roundabout from a linked list/free list, or we could 
-// partition a larger ring into 32 buckets, give each one a bitmap, 
+// we could build a larger roundabout from a linked list/free list, or we could
+// partition a larger ring into 32 buckets, give each one a bitmap,
 // and do some special dancing to ensure we don't get a race from updating the header
 // + the bitmap at the same time
 
@@ -205,7 +205,7 @@ func (rb *Roundabout) Active(epoch uint16) bool {
 	if h.epoch == epoch {
 		return h.bitmap == 0
 	}
-	
+
 	// if we're within width bits, epoch could have
 	// active predecessors
 
