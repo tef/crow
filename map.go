@@ -34,6 +34,9 @@ func (m *LockedMap) Load(key any) (value any, ok bool) {
 		value, ok = m.inner[key]
 		return nil
 	})
+	if value == nil {
+		return nil, false
+	}
 	return
 }
 
@@ -60,10 +63,16 @@ func (m *LockedMap) Swap(key, value any) (previous any, loaded bool) {
 		m.inner[key] = value
 		return nil
 	})
+	if previous == nil {
+		return nil, false
+	}
 	return
 }
 
 func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
+	if old == nil {
+		return false
+	}
 	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
@@ -71,7 +80,9 @@ func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
 		v, ok := m.inner[key]
 		if ok && v == old {
 			delete(m.inner, key)
-			deleted = true
+			if v != nil {
+				deleted = true
+			}
 		}
 
 		return nil
@@ -80,6 +91,9 @@ func (m *LockedMap) CompareAndDelete(key, old any) (deleted bool) {
 }
 
 func (m *LockedMap) CompareAndSwap(key, old, new any) (swapped bool) {
+	if old == nil {
+		return false
+	}
 	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
@@ -114,6 +128,9 @@ func (m *LockedMap) LoadAndDelete(key any) (value any, loaded bool) {
 		delete(m.inner, key)
 		return nil
 	})
+	if value == nil {
+		return nil, false
+	}
 	return
 
 }
@@ -129,6 +146,9 @@ func (m *LockedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 		}
 		return nil
 	})
+	if actual == nil {
+		return nil, false
+	}
 	return
 }
 
@@ -156,9 +176,37 @@ func (m *LockedMap) Clear() {
 
 // Locked with Update
 
+type BoxedEntry struct {
+	inner atomic.Value
+}
+
+func (b *BoxedEntry) Load() (any, bool) {
+	v := b.inner.Load()
+	if v == nil {
+		return nil, false
+	}
+	return v, true
+}
+
+func (b *BoxedEntry) Store(o any) {
+	b.inner.Store(o)
+}
+
+func (b *BoxedEntry) CompareAndSwap(old any, new any) bool {
+	if old == nil {
+		return false
+	}
+	return b.inner.CompareAndSwap(old, new)
+}
+
+func (b *BoxedEntry) Delete() {
+	b.inner.Store(nil)
+}
+
+
 type BoxedMap struct {
 	rb    Roundabout
-	inner map[any]*atomic.Value
+	inner map[any]*BoxedEntry
 }
 
 func (m *BoxedMap) Load(key any) (value any, ok bool) {
@@ -174,6 +222,9 @@ func (m *BoxedMap) Load(key any) (value any, ok bool) {
 		}
 		return nil
 	})
+	if value == nil {
+		return nil, false
+	}
 	return
 }
 
@@ -182,11 +233,14 @@ func (m *BoxedMap) init() {
 }
 
 func (m *BoxedMap) Store(key, value any) {
+	// XXX look up in map first, then store if not found
+	// else reuse BoxedEntry
+
 	m.rb.LockRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			m.init()
 		}
-		v := new(atomic.Value)
+		v := new(BoxedEntry)
 		v.Store(value)
 		m.inner[key] = v
 		return nil
@@ -205,7 +259,7 @@ func (m *BoxedMap) Swap(key, value any) (previous any, loaded bool) {
 			previous = v.Load()
 			v.Store(value)
 		} else {
-			v := new(atomic.Value)
+			v := new(BoxedEntry)
 			v.Store(value)
 			m.inner[key] = v
 			previous = value
@@ -213,20 +267,25 @@ func (m *BoxedMap) Swap(key, value any) (previous any, loaded bool) {
 
 		return nil
 	})
+	if previous == nil {
+		return nil, false
+	}
 	return
 }
 
 func (m *BoxedMap) CompareAndDelete(key, old any) (deleted bool) {
-	m.rb.LockRing(func(epoch uint16, flags uint16) error {
+	if old == nil {
+		return false
+	}
+	m.rb.OrderRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
 		v, ok := m.inner[key]
-		if ok && v == nil {
+		if ok && v != nil {
 			value := v.Load()
 			if value == old {
-				delete(m.inner, key)
-				deleted = true
+				deleted = v.CompareAndSwap(value, nil)
 			}
 		}
 
@@ -241,12 +300,8 @@ func (m *BoxedMap) CompareAndSwap(key, old any, newv any) (swapped bool) {
 			return nil
 		}
 		v, ok := m.inner[key]
-		if ok && v == nil {
-			value := v.Load()
-			if value == old {
-				m.inner[key].Store(newv)
-				swapped = true
-			}
+		if ok && v != nil {
+			swapped = v.CompareAndSwap(old, newv)
 		}
 
 		return nil
@@ -261,13 +316,16 @@ func (m *BoxedMap) Delete(key any) {
 		if m.inner == nil {
 			return nil
 		}
-		delete(m.inner, key)
+		v, ok := m.inner[key]
+		if ok && v != nil {
+			v.Delete()
+		}
 		return nil
 	})
 }
 
 func (m *BoxedMap) LoadAndDelete(key any) (value any, loaded bool) {
-	m.rb.LockRing(func(epoch uint16, flags uint16) error {
+	m.rb.OrderRing(func(epoch uint16, flags uint16) error {
 		if m.inner == nil {
 			return nil
 		}
@@ -275,11 +333,15 @@ func (m *BoxedMap) LoadAndDelete(key any) (value any, loaded bool) {
 		if ok && v != nil {
 			value = v.Load()
 			loaded = ok
+			v.Delete()
 		}
 
 		delete(m.inner, key)
 		return nil
 	})
+	if value == nil {
+		return nil, loaded
+	}
 	return
 
 }
@@ -290,16 +352,15 @@ func (m *BoxedMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 			return nil
 		}
 		v, ok := m.inner[key]
-		if ok {
-			loaded = false
+		if ok && v != nil {
+			actual = v.Load()
+			loaded = actual != nil
+		}
+			
+		if !loaded {
 			actual = value
-
+			// this could be two operations
 			m.inner[key].Store(value)
-		} else {
-			loaded = true
-			if v != nil {
-				actual = v.Load()
-			}
 		}
 		return nil
 	})
@@ -310,6 +371,10 @@ func (m *BoxedMap) Range(f func(key, value any) bool) {
 	// inserts/deletes or anything triggering resize should be fine
 	// and other reads should be fine, and the values
 	// inside are atomic
+
+	// nb go map allows map operations inside this,
+	// so we should make a copy
+	var copy map[any]*BoxedEntry
 	m.rb.ShareRing(func(epoch uint16, flags uint16) error {
 		if len(m.inner) == 0 {
 			return nil
@@ -319,12 +384,17 @@ func (m *BoxedMap) Range(f func(key, value any) bool) {
 			if v != nil {
 				a = v.Load()
 			}
-			if !f(k, a) {
-				break
+			if a != nil {
+				copy[k] = a
 			}
 		}
 		return nil
 	})
+	for k, v := range copy {
+		if !f(k, a) {
+			break
+		}
+	}
 
 }
 
@@ -342,21 +412,28 @@ type map_entry struct {
 }
 
 type ReadWriteMap struct {
-	rb    Roundabout
-	read  atomic.Pointer[map[any]*map_entry]
-	write map[any]*map_entry
+	rb      Roundabout
+	read    atomic.Pointer[map[any]*map_entry]
+	write   map[any]*map_entry
+	changes map[any]bool // tells us which entries are deleted/new in write
 }
 
 /*
+	promote to read:
+		when misses >= updates
+		with lock, swap write and read
+		then copy changes into new write using changes map
+		dont need to mark expunged, promotion locks any changes being made
+		empty changes
+	insert
+		if write empty, create dict
+		insert into dict, copy to write, read
+		else lookup, then add to write and update changes 
 	read
 		load from read, check for dead or nil entry
 		if miss, ShareRing() on write
-	insert
-		load from read, check for expunged record, if so,
-		insert it into write, and unexpunge it
-		else create new and insert into write
 	delete
-		if in read, atomically update value
+		if in read, atomically update value to tombstone
 		if not in read, WriteRing to check write
 			and delete value with nil - can't delete unless we're sure it's not in read
 	update

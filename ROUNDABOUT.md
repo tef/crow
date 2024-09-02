@@ -148,31 +148,38 @@ The logic might go something like this:
 - each bucket has it's own bitmap, tracking individual active/dead status 
 - high bits of epoch match to a bucket, low bits match to a cell within each bucket
 
-to allocate
+To allocate
 - increment epoch, if it's in the same bucket, then we insert out item, we're done
 - if it's in a new bucket, we first check to see if the bucket is free, we mark bucket as in use
 and then update our item
 
-to scan
+To scan
 - we look at the bucket bitmap in the header, and pull in the bucket headers when scanning
 
-to remove
+To remove
 - we update our bitmap, and if it's now all 0's for this bucket, we reset the bitmap, 
 - and then mark it as free in the header
 
-to ensure there's no race between updating the header and a mark being in the bitmap for an active process,
+To ensure there's no race between updating the header and a mark being in the bitmap for an active process,
 we need to be careful, if we reset the bucket bitmap to 'in use' after 'free' before we update the header, another process might accidentally see it as 'in-use'. if we mark the bucket as clear in the header first, another process might see it as 'free' before 'in-use' and skip over slots. this way lies false positvies or false negatives.
 
-instead, we place the burden on the allocating thread, not the deallocating thread
+Instead, we place the burden on the allocating thread, not the deallocating thread
 - when a new item is the first item in a bucket, we check that it is clear in the header, 
 - then we check the bucket bitmap to say "in use" for all, then we can allocate
 - any new process that arrives will see the header as being clear, and skip it, or it will see a fully in use bucket, and skip over the later elements as not being < epoch
 - if two processes race, it's stil safe. one will flip the bits first, and the other might allocate first, but neither is locked.
 
+# Linked lists of roundabouts
 
-instead, we put the burden on the allocator
-- we mark the bucket ahead of time as being all active, but it will be ignored as the bucket is not in use
-- 
+The problem with having a larger log is that for the most part, threads will spend longer amounts of time
+scanning the log to look for conflicts. On the other hand, having a shorter log leads threads contending to
+get on the log, with the potential for some threads stalling hard.
 
+One potential solution to this is something like a linked list of roundabouts
 
+- There's the currently active roundabout, which loops around as usual
+- If the roundabout is full, a new roundabout is allocated, and threads fill up the buffer as before, but
+  do not scan predecessors, or don't have to, and spin on the original roundabout waiting to for it to empty out
+- Once the current roundabout has been drained, the replacement is made active, and any thread waiting on it will see the change, and begin scanning, if they haven't already
+- Any free roundabout can be put on a list for reuse, using the epoch
 
